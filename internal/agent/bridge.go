@@ -21,6 +21,19 @@ type AgentBridge interface {
 	GetStatus(profileID string) model.AgentStatus
 }
 
+// Provider is the full interface used by the server and API layers.
+// Both MockBridge and HermesBridge implement it.
+type Provider interface {
+	LoadProfiles(profiles []model.Profile)
+	StartAll(ctx context.Context) error
+	Start(ctx context.Context, profile *model.Profile) error
+	Stop(profileID string) error
+	SendMessage(ctx context.Context, profileID, message string) (string, error)
+	GetStatus(profileID string) model.AgentStatus
+	GetAllStatus() []model.AgentStatus
+	GetProfiles() []model.Profile
+}
+
 // AgentStatus represents the runtime state of an agent.
 type AgentState struct {
 	Profile  *model.Profile

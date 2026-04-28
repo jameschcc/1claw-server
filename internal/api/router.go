@@ -16,12 +16,12 @@ import (
 type Server struct {
 	Router  *mux.Router
 	Hub     *ws.Hub
-	Bridge  *agent.MockBridge
+	Bridge  agent.Provider
 	Config  *model.ServerConfig
 }
 
 // NewServer creates a new API server.
-func NewServer(hub *ws.Hub, bridge *agent.MockBridge, cfg *model.ServerConfig) *Server {
+func NewServer(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *Server {
 	s := &Server{
 		Router: mux.NewRouter(),
 		Hub:    hub,

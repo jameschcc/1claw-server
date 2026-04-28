@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"1claw-server/internal/agent"
@@ -17,24 +18,42 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for development
+		return true
 	},
 }
 
 // WSHandler handles WebSocket upgrade requests and wires them to the hub.
 type WSHandler struct {
 	Hub    *ws.Hub
-	Bridge *agent.MockBridge
+	Bridge agent.Provider
 	Config *model.ServerConfig
 }
 
 // NewWSHandler creates a new WebSocket handler.
-func NewWSHandler(hub *ws.Hub, bridge *agent.MockBridge, cfg *model.ServerConfig) *WSHandler {
-	return &WSHandler{
+func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *WSHandler {
+	h := &WSHandler{
 		Hub:    hub,
 		Bridge: bridge,
 		Config: cfg,
 	}
+
+	// If bridge supports async responses, wire up the callback
+	if hb, ok := bridge.(*agent.HermesBridge); ok {
+		hb.OnChatResponse = func(profileID, content, msgID string) {
+			// Route to all connected clients
+			resp := model.WSResponse{
+				Type:      "chat",
+				ProfileID: profileID,
+				Content:   content,
+				ID:        msgID,
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			}
+			h.Hub.BroadcastJSON(resp)
+		}
+		log.Println("[ws] Hermes bridge async response routing enabled")
+	}
+
+	return h
 }
 
 // ServeWS upgrades the HTTP connection to WebSocket and starts read/write pumps.
@@ -65,15 +84,23 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 
 		response, err := h.Bridge.SendMessage(ctx, msg.ProfileID, msg.Content)
 		if err != nil {
+			// Async bridge: response comes later via OnChatResponse callback.
+			// Don't send error — just log it.
+			errMsg := err.Error()
+			if strings.HasPrefix(errMsg, "async:") {
+				log.Printf("[ws] async send to %s (msg %s)", msg.ProfileID, msg.ID)
+				return
+			}
+			// Real error
 			c.SendJSON(model.WSResponse{
 				Type:    "error",
 				Code:    "agent_error",
-				Message: err.Error(),
+				Message: errMsg,
 			})
 			return
 		}
 
-		// Send response back to the requesting client
+		// Sync bridge (MockBridge): send response immediately
 		c.SendJSON(model.WSResponse{
 			Type:      "chat",
 			ProfileID: msg.ProfileID,

@@ -16,13 +16,13 @@ import (
 	"1claw-server/internal/agent"
 	"1claw-server/internal/api"
 	"1claw-server/internal/config"
-	"1claw-server/internal/model"
 	"1claw-server/internal/ws"
 )
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	hermesHome := flag.String("hermes-home", "", "Path to Hermes home (~/.hermes)")
+	useMock := flag.Bool("mock", false, "Use MockBridge instead of real Hermes")
 	flag.Parse()
 
 	// Load configuration
@@ -36,7 +36,6 @@ func main() {
 	if hh == "" {
 		if hermesPath, err := exec.LookPath("hermes"); err == nil {
 			if target, err := filepath.EvalSymlinks(hermesPath); err == nil {
-				// Walk up from binary until we find profiles/ dir
 				dir := filepath.Dir(target)
 				for i := 0; i < 5; i++ {
 					if _, err := os.Stat(filepath.Join(dir, "profiles")); err == nil {
@@ -62,37 +61,53 @@ func main() {
 	if err != nil {
 		log.Printf("Warning: could not discover profiles: %v", err)
 	}
-	if len(userProfiles) == 0 {
-		log.Println("Warning: no Hermes profiles found, trying default")
-		defaultProf, _ := config.DiscoverDefaultProfile(hh)
-		if defaultProf != nil {
-			userProfiles = append(userProfiles, *defaultProf)
-		}
-	}
-
-	// Merge: config.yaml profiles override auto-discovered ones
-	profileMap := make(map[string]model.Profile)
-	for _, p := range userProfiles {
-		profileMap[p.ID] = p
-	}
-	for _, p := range cfg.Profiles {
-		profileMap[p.ID] = p
-	}
-
-	// Convert back to slice
-	profiles := make([]model.Profile, 0, len(profileMap))
-	for _, p := range profileMap {
-		profiles = append(profiles, p)
-	}
-	cfg.Profiles = profiles
+	cfg.Profiles = userProfiles
 
 	// Initialize WebSocket hub
 	hub := ws.NewHub()
 	go hub.Run()
 
 	// Initialize agent bridge
-	bridge := agent.NewMockBridge()
-	bridge.LoadProfiles(cfg.Profiles)
+	var bridge agent.Provider
+	var pythonPath string
+
+	if *useMock || !hermesAvailable() {
+		if *useMock {
+			log.Println("[bridge] Using MockBridge (--mock flag)")
+		} else {
+			log.Println("[bridge] Hermes not available, falling back to MockBridge")
+		}
+		mb := agent.NewMockBridge()
+		mb.LoadProfiles(cfg.Profiles)
+		bridge = mb
+	} else {
+		log.Println("[bridge] Starting Hermes Python bridge ...")
+		// Find the Hermes venv python
+		pythonPath = filepath.Join(hh, "hermes-agent", "venv", "bin", "python3")
+		if _, err := os.Stat(pythonPath); os.IsNotExist(err) {
+			log.Printf("Warning: Hermes python not found at %s, falling back to MockBridge", pythonPath)
+			mb := agent.NewMockBridge()
+			mb.LoadProfiles(cfg.Profiles)
+			bridge = mb
+		} else {
+			scriptPath := filepath.Join(findServerDir(), "scripts", "hermes_bridge.py")
+			hb := agent.NewHermesBridge()
+			hb.LoadProfiles(cfg.Profiles)
+			subCtx := context.Background()
+			if err := hb.StartSubprocess(subCtx, pythonPath, scriptPath); err != nil {
+				log.Printf("Warning: failed to start Hermes bridge: %v, falling back to MockBridge", err)
+				mb := agent.NewMockBridge()
+				mb.LoadProfiles(cfg.Profiles)
+				bridge = mb
+			} else {
+				// Send profiles to the bridge now that stdin is ready
+				if err := hb.SendInit(); err != nil {
+					log.Printf("Warning: failed to init Hermes bridge: %v", err)
+				}
+				bridge = hb
+			}
+		}
+	}
 
 	// Start all agent profiles
 	ctx := context.Background()
@@ -101,13 +116,9 @@ func main() {
 	}
 	log.Printf("Loaded %d agent profiles", len(cfg.Profiles))
 
-	// Create API server
+	// Create API server + WS handler
 	apiServer := api.NewServer(hub, bridge, cfg)
-
-	// Create WebSocket handler
 	wsHandler := api.NewWSHandler(hub, bridge, cfg)
-
-	// Register WebSocket route
 	apiServer.Router.HandleFunc(cfg.Server.WSPath, wsHandler.ServeWS)
 
 	// Build the HTTP server
@@ -126,6 +137,7 @@ func main() {
 		log.Printf("  WebSocket: ws://%s%s", addr, cfg.Server.WSPath)
 		log.Printf("  API:       http://%s%s", addr, cfg.Server.APIPath)
 		log.Printf("  Health:    http://%s/health", addr)
+		log.Printf("  Bridge:    %s", bridgeType(bridge))
 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
@@ -146,7 +158,13 @@ func main() {
 		}
 	}
 
-	// Shutdown HTTP server with timeout
+	// Close Hermes bridge subprocess
+	if hb, ok := bridge.(*agent.HermesBridge); ok {
+		if err := hb.Close(); err != nil {
+			log.Printf("Error closing bridge: %v", err)
+		}
+	}
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -155,4 +173,37 @@ func main() {
 	}
 
 	log.Println("Server stopped gracefully")
+}
+
+func hermesAvailable() bool {
+	_, err := exec.LookPath("hermes")
+	return err == nil
+}
+
+func findServerDir() string {
+	// Try to find the server dir relative to the binary
+	exe, err := os.Executable()
+	if err == nil {
+		dir := filepath.Dir(exe)
+		// Check if scripts/ exists next to the binary
+		if _, err := os.Stat(filepath.Join(dir, "scripts")); err == nil {
+			return dir
+		}
+		// Check parent
+		parent := filepath.Dir(dir)
+		if _, err := os.Stat(filepath.Join(parent, "scripts")); err == nil {
+			return parent
+		}
+	}
+	// Fallback
+	return "/home/j/Codes/1claw/1claw-server"
+}
+
+func bridgeType(b agent.Provider) string {
+	switch b.(type) {
+	case *agent.HermesBridge:
+		return "Hermes AI (real) — subprocess running"
+	default:
+		return "Mock (simulated responses)"
+	}
 }

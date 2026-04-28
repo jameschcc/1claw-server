@@ -25,6 +25,10 @@ type HermesBridge struct {
 	agents   map[string]bool // profile_id → loaded
 	ready    chan struct{}
 	stopCh   chan struct{}
+
+	// OnChatResponse is called when the Python bridge responds to a chat.
+	// Set by the WS handler to route responses to WebSocket clients.
+	OnChatResponse func(profileID, content, msgID string)
 }
 
 // NewHermesBridge creates a new bridge connected to the Hermes Python subprocess.
@@ -80,18 +84,24 @@ func (b *HermesBridge) StartSubprocess(ctx context.Context, pythonPath, scriptPa
 	return nil
 }
 
-// LoadProfiles sends profile configurations to the Python bridge.
+// LoadProfiles stores profile configurations (queued for send after subprocess starts).
 func (b *HermesBridge) LoadProfiles(profiles []model.Profile) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, p := range profiles {
-		prof := p // copy
+		prof := p
 		b.profiles[p.ID] = &prof
 	}
-	b.mu.Unlock()
+}
 
-	// Send init command to Python bridge
-	profileList := make([]map[string]interface{}, 0, len(profiles))
-	for _, p := range profiles {
+// SendInit sends the init command to the Python bridge with all loaded profiles.
+// Must be called after StartSubprocess.
+func (b *HermesBridge) SendInit() error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	profileList := make([]map[string]interface{}, 0, len(b.profiles))
+	for _, p := range b.profiles {
 		profileList = append(profileList, map[string]interface{}{
 			"id":             p.ID,
 			"name":           p.Name,
@@ -106,9 +116,7 @@ func (b *HermesBridge) LoadProfiles(profiles []model.Profile) {
 		"type":     "init",
 		"profiles": profileList,
 	})
-	if err != nil {
-		log.Printf("[hermes] init error: %v", err)
-	}
+	return err
 }
 
 // waitReady blocks until the bridge sends "ready".
@@ -242,15 +250,12 @@ func (b *HermesBridge) readResponses() {
 			close(b.ready)
 
 		case "chat":
-			// Chat responses are logged; the Go server
-			// routes them to WebSocket clients via a callback.
 			pid, _ := resp["profile_id"].(string)
 			content, _ := resp["content"].(string)
 			msgID, _ := resp["id"].(string)
-			log.Printf("[hermes] chat response [%s]: %s", pid, truncate(content, 80))
-			// In a full implementation, this would be pushed to a channel
-			// that the WS handler reads from.
-			_ = msgID
+			if b.OnChatResponse != nil {
+				b.OnChatResponse(pid, content, msgID)
+			}
 
 		case "status":
 			profilesRaw, ok := resp["profiles"].([]interface{})
