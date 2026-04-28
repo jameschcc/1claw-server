@@ -162,17 +162,18 @@ class HermesBridge:
         # Load profile config for model settings
         cfg = self._load_profile_config(pid)
 
-        # Redirect AIAgent's stdout chatter to stderr, keep _send on real stdout
-        _real_stdout = sys.stdout
+        # Tell AIAgent which profile it is (loads persona, AGENTS.md, memory)
+        _old_profile = os.environ.get("HERMES_PROFILE")
+        os.environ["HERMES_PROFILE"] = pid
         try:
+            # Redirect AIAgent's stdout chatter to stderr
+            _real_stdout = sys.stdout
             sys.stdout = sys.stderr
             agent = AIAgent(
                 provider=cfg.get("provider", ""),
                 model=cfg.get("model", "deepseek-v4-flash"),
                 base_url=cfg.get("base_url", ""),
                 api_key=cfg.get("api_key", None),
-                skip_memory=True,
-                skip_context_files=True,
                 quiet_mode=True,
             )
             self.agents[pid] = agent
@@ -181,6 +182,10 @@ class HermesBridge:
             return
         finally:
             sys.stdout = _real_stdout
+            if _old_profile is not None:
+                os.environ["HERMES_PROFILE"] = _old_profile
+            else:
+                os.environ.pop("HERMES_PROFILE", None)
 
         self._send({"type": "agent_ready", "profile_id": pid, "status": "real"})
         log.info("  ✅ %s (%s) — real AI agent", name, pid)
