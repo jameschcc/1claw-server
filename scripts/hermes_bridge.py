@@ -23,6 +23,7 @@ import json
 import os
 import signal
 import logging
+import threading
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,8 +32,40 @@ logging.basicConfig(
 )
 log = logging.getLogger("bridge")
 
+# Keep original stdout for JSON protocol (immune to thread-local redirections)
+_original_stdout = sys.stdout
+
 # Defer heavy imports until init
 AIAgent = None
+
+
+def load_env_file(path):
+    """Load a .env file into os.environ if it exists."""
+    if not os.path.isfile(path):
+        return False
+    log.info("Loading env: %s", path)
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip("\"'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+    return True
+
+
+def find_hermes_home():
+    """Find the Hermes home directory."""
+    path = os.environ.get("HERMES_HOME")
+    if path:
+        return path
+    path = os.path.expanduser("~/.hermes")
+    if os.path.isdir(path):
+        return path
+    return None
 
 
 def import_hermes():
@@ -41,28 +74,39 @@ def import_hermes():
     if AIAgent is not None:
         return
 
-    # Try standard Hermes install path
-    hermes_home = os.environ.get("HERMES_HOME")
+    hermes_home = find_hermes_home()
     if not hermes_home:
-        hermes_home = os.path.expanduser("~/.hermes/hermes-agent")
+        log.warning("Hermes home not found — using fallback")
+        _init_echo_fallback()
+        return
 
-    hermes_path = os.path.abspath(hermes_home)
-    if hermes_path not in sys.path:
-        sys.path.insert(0, hermes_path)
+    # Load main .env first
+    load_env_file(os.path.join(hermes_home, ".env"))
+    load_env_file("/etc/environment")
+
+    # Add Hermes agent to path
+    agent_path = os.path.join(hermes_home, "hermes-agent")
+    if os.path.isdir(agent_path) and agent_path not in sys.path:
+        sys.path.insert(0, agent_path)
 
     try:
         from run_agent import AIAgent as HermesAIAgent
         AIAgent = HermesAIAgent
-        log.info("AIAgent imported from %s", hermes_path)
+        log.info("AIAgent imported from %s", agent_path)
     except ImportError as e:
         log.warning("AIAgent import failed: %s — using fallback", e)
-        # Fallback: simple echo agent
-        class EchoAgent:
-            def __init__(self, **kwargs):
-                self.name = kwargs.get("name", "Agent")
-            def chat(self, message):
-                return f"[{self.name}] You said: {message}"
-        AIAgent = EchoAgent
+        _init_echo_fallback()
+
+
+def _init_echo_fallback():
+    """Set AIAgent to a simple echo agent."""
+    global AIAgent
+    class EchoAgent:
+        def __init__(self, **kwargs):
+            self.name = kwargs.get("name", "Agent")
+        def chat(self, message):
+            return f"[{self.name}] You said: {message}"
+    AIAgent = EchoAgent
 
 
 class HermesBridge:
@@ -71,34 +115,79 @@ class HermesBridge:
         self.profiles = {}  # profile_id → profile info
         self.ready = False
 
+    def _init_echo(self, p):
+        """Create an echo agent for the given profile dict."""
+        pid = p.get("id", "")
+        name = p.get("name", pid)
+        echo = type("EchoAgent", (), {"chat": lambda self, m, n=name: f"[{n}] You said: {m}"})()
+        self.agents[pid] = echo
+        return echo
+
+    def _init_real_agent(self, p):
+        """Initialize a real AIAgent for a profile (runs in background thread)."""
+        pid = p.get("id", "")
+        name = p.get("name", pid)
+        hermes_home = find_hermes_home()
+
+        # Load profile-specific .env
+        if hermes_home:
+            profile_env = os.path.join(hermes_home, "profiles", pid, ".env")
+            load_env_file(profile_env)
+
+        # Redirect AIAgent's stdout chatter to stderr, keep _send on real stdout
+        _real_stdout = sys.stdout
+        try:
+            sys.stdout = sys.stderr
+            agent = AIAgent(
+                model="deepseek-v4-flash",
+                skip_memory=True,
+                skip_context_files=True,
+                quiet_mode=True,
+            )
+            self.agents[pid] = agent
+        except Exception as e:
+            log.warning("  ⚠️  %s real init failed: %s — keeping echo", pid, e)
+            return
+        finally:
+            sys.stdout = _real_stdout
+
+        self._send({"type": "agent_ready", "profile_id": pid, "status": "real"})
+        log.info("  ✅ %s (%s) — real AI agent", name, pid)
+
     def handle_init(self, msg):
-        """Initialize all agent profiles."""
+        """Initialize all agent profiles — echo immediately, real AI in background."""
         profiles = msg.get("profiles", [])
         log.info("Initializing %d profiles ...", len(profiles))
 
         import_hermes()
+        hermes_home = find_hermes_home()
 
         for p in profiles:
             pid = p.get("id", "")
             if not pid:
                 continue
             self.profiles[pid] = p
-            try:
-                agent = AIAgent(
-                    skip_memory=True,
-                    skip_context_files=True,
-                    quiet_mode=True,
-                )
-                self.agents[pid] = agent
-                log.info("  ✅ %s (%s)", p.get("name", pid), pid)
-            except Exception as e:
-                log.warning("  ⚠️  %s init failed: %s — using echo fallback", pid, e)
-                echo = type("EchoAgent", (), {"chat": lambda self, m, name=p.get("name",pid): f"[{name}] You said: {m}"})()
-                self.agents[pid] = echo
+            # Echo agent immediately
+            self._init_echo(p)
+
+        # Load all profile envs for the background real-agent inits
+        for p in profiles:
+            pid = p.get("id", "")
+            if pid and hermes_home:
+                profile_env = os.path.join(hermes_home, "profiles", pid, ".env")
+                load_env_file(profile_env)
 
         self.ready = True
         self._send({"type": "ready", "profile_count": len(self.agents)})
-        log.info("Bridge ready — %d agents loaded", len(self.agents))
+        log.info("Bridge ready — %d agents (echo). Initializing real AI in background...",
+                 len(self.agents))
+
+        # Start real AI agents in background
+        for p in profiles:
+            pid = p.get("id", "")
+            if pid:
+                t = threading.Thread(target=self._init_real_agent, args=(p,), daemon=True)
+                t.start()
 
     def handle_chat(self, msg):
         """Route a chat message to the appropriate agent."""
@@ -116,14 +205,10 @@ class HermesBridge:
             return
 
         agent = self.agents[pid]
+        _real_stdout = sys.stdout
         try:
+            sys.stdout = sys.stderr
             response = agent.chat(content)
-            self._send({
-                "type": "chat",
-                "profile_id": pid,
-                "content": response,
-                "id": msg_id,
-            })
         except Exception as e:
             log.error("Chat error for %s: %s", pid, e)
             self._send({
@@ -132,6 +217,16 @@ class HermesBridge:
                 "message": str(e),
                 "id": msg_id,
             })
+            return
+        finally:
+            sys.stdout = _real_stdout
+
+        self._send({
+            "type": "chat",
+            "profile_id": pid,
+            "content": response,
+            "id": msg_id,
+        })
 
     def handle_status(self, msg):
         """Return current status of all profiles."""
@@ -151,11 +246,32 @@ class HermesBridge:
             })
         self._send({"type": "status", "profiles": profiles})
 
+    def handle_start_profile(self, msg):
+        """Start a real AI agent for a specific profile (lazy init)."""
+        pid = msg.get("profile_id", "")
+        if not pid:
+            self._send({"type": "error", "code": "MISSING_PROFILE", "message": "profile_id required"})
+            return
+        if pid not in self.profiles:
+            self._send({"type": "error", "code": "PROFILE_NOT_FOUND", "message": f"Unknown profile: {pid}"})
+            return
+
+        # Check if already a real agent
+        if pid in self.agents:
+            self._send({"type": "agent_ready", "profile_id": pid, "status": "real"})
+            return
+
+        log.info("Lazy init: starting real agent for '%s' ...", pid)
+        p = self.profiles[pid]
+        t = threading.Thread(target=self._init_real_agent, args=(p,), daemon=True)
+        t.start()
+        self._send({"type": "agent_starting", "profile_id": pid})
+
     def _send(self, data):
-        """Write a JSON line to stdout."""
+        """Write a JSON line to the original stdout (thread-safe)."""
         line = json.dumps(data, ensure_ascii=False)
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+        _original_stdout.write(line + "\n")
+        _original_stdout.flush()
 
     def run(self):
         """Main loop: read JSON lines from stdin, dispatch."""
@@ -177,6 +293,8 @@ class HermesBridge:
                 self.handle_chat(msg)
             elif cmd == "status":
                 self.handle_status(msg)
+            elif cmd == "start_profile":
+                self.handle_start_profile(msg)
             elif cmd == "shutdown":
                 log.info("Shutdown requested")
                 break

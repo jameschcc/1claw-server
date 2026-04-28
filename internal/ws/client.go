@@ -29,11 +29,13 @@ type Client struct {
 	Hub    *Hub
 	Conn   *websocket.Conn
 	Send   chan []byte
-	ActiveProfile string // currently selected profile ID
+	ActiveProfile string
 
 	// Handler for incoming chat messages.
-	// Called when a chat message is received from this client.
 	OnChat func(client *Client, msg model.WSMessage)
+
+	// Handler for other incoming messages (start_profile, etc.)
+	OnMessage func(client *Client, msg model.WSMessage)
 }
 
 // NewClient creates a new Client.
@@ -114,7 +116,8 @@ func (c *Client) WritePump() {
 }
 
 func (c *Client) handleMessage(msg model.WSMessage) {
-	switch msg.Type {
+	msgType := msg.Type
+	switch msgType {
 	case "ping":
 		c.sendPong()
 
@@ -128,15 +131,15 @@ func (c *Client) handleMessage(msg model.WSMessage) {
 		log.Printf("[ws] client %s switched to profile %s", c.ID, msg.ProfileID)
 
 	case "get_status":
-		// Status query — handled by the server layer
-		c.Hub.BroadcastJSON(model.WSResponse{
-			Type: "pong",
-		})
-		// Usually the main server handler will respond to this.
-		// We delegate to the OnChat/OnStatus handler.
+		c.sendPong()
 
 	default:
-		c.sendError("unknown_type", "Unknown message type: "+msg.Type)
+		// Forward to generic handler
+		if c.OnMessage != nil {
+			c.OnMessage(c, msg)
+		} else {
+			c.sendError("unknown_type", "Unknown message type: "+msgType)
+		}
 	}
 }
 

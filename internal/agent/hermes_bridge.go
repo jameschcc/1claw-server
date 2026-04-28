@@ -138,9 +138,18 @@ func (b *HermesBridge) Start(ctx context.Context, profile *model.Profile) error 
 	return nil
 }
 
-// StartAll waits for the bridge to be ready.
+// StartAll waits for the bridge to be ready and marks all profiles as online.
 func (b *HermesBridge) StartAll(ctx context.Context) error {
-	return b.waitReady(30 * time.Second)
+	if err := b.waitReady(60 * time.Second); err != nil {
+		return err
+	}
+	// Mark all profiles as online
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for id := range b.profiles {
+		b.agents[id] = true
+	}
+	return nil
 }
 
 // Stop implements AgentBridge.
@@ -220,6 +229,13 @@ func (b *HermesBridge) Close() error {
 	return nil
 }
 
+// SendRaw sends an arbitrary JSON command to the Python bridge.
+func (b *HermesBridge) SendRaw(v map[string]interface{}) {
+	if err := b.send(v); err != nil {
+		log.Printf("[hermes] send error: %v", err)
+	}
+}
+
 // --- internal ---
 
 func (b *HermesBridge) send(v interface{}) error {
@@ -248,6 +264,21 @@ func (b *HermesBridge) readResponses() {
 			profileCount, _ := resp["profile_count"].(float64)
 			log.Printf("[hermes] bridge ready with %.0f profiles", profileCount)
 			close(b.ready)
+
+		case "agent_ready":
+			pid, _ := resp["profile_id"].(string)
+			status, _ := resp["status"].(string)
+			log.Printf("[hermes] agent %s is %s", pid, status)
+			if b.OnChatResponse != nil && status == "real" {
+				b.OnChatResponse(pid, "__agent_ready__", "")
+			}
+
+		case "agent_starting":
+			pid, _ := resp["profile_id"].(string)
+			log.Printf("[hermes] agent %s starting...", pid)
+			if b.OnChatResponse != nil {
+				b.OnChatResponse(pid, "__agent_starting__", "")
+			}
 
 		case "chat":
 			pid, _ := resp["profile_id"].(string)
