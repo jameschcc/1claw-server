@@ -19,6 +19,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
+	useHermes := flag.Bool("hermes", false, "Use real Hermes AI agents (subprocess bridge)")
 	flag.Parse()
 
 	// Load configuration
@@ -35,12 +36,16 @@ func main() {
 	bridge := agent.NewMockBridge()
 	bridge.LoadProfiles(cfg.Profiles)
 
+	if *useHermes {
+		log.Println("[bridge] Hermes mode requested — falling back to MockBridge (real bridge coming soon)")
+	}
+
 	// Start all agent profiles
 	ctx := context.Background()
 	if err := bridge.StartAll(ctx); err != nil {
 		log.Fatalf("Failed to start agents: %v", err)
 	}
-	log.Printf("Started %d agent profiles", len(cfg.Profiles))
+	log.Printf("Started %d agent profiles (bridge: mock)", len(cfg.Profiles))
 
 	// Create API server
 	apiServer := api.NewServer(hub, bridge, cfg)
