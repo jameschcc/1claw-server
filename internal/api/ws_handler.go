@@ -39,13 +39,8 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *
 
 	if hb, ok := bridge.(*agent.HermesBridge); ok {
 		hb.OnChatResponse = func(profileID, content, msgID string) {
-			// Special status messages from the bridge
 			if content == "__agent_ready__" {
-				profiles := h.Bridge.GetProfiles()
-				for i := range profiles {
-					st := h.Bridge.GetStatus(profiles[i].ID)
-					profiles[i].Online = st.Online
-				}
+				profiles := updateProfileStatus(h.Bridge)
 				h.Hub.NotifyProfileUpdate(profiles)
 				return
 			}
@@ -59,6 +54,17 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *
 					}
 				}
 				h.Hub.NotifyProfileUpdate(profiles)
+				return
+			}
+			if strings.HasPrefix(content, "__reasoning__:") {
+				reasoningText := strings.TrimPrefix(content, "__reasoning__:")
+				resp := model.WSResponse{
+					Type:      "reasoning",
+					ProfileID: profileID,
+					Content:   reasoningText,
+					ID:        msgID,
+				}
+				h.Hub.BroadcastJSON(resp)
 				return
 			}
 
@@ -163,4 +169,13 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		Type:     "status",
 		Profiles: profiles,
 	})
+}
+
+func updateProfileStatus(b agent.Provider) []model.Profile {
+	profiles := b.GetProfiles()
+	for i := range profiles {
+		st := b.GetStatus(profiles[i].ID)
+		profiles[i].Online = st.Online
+	}
+	return profiles
 }

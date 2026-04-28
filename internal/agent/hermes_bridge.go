@@ -280,6 +280,14 @@ func (b *HermesBridge) readResponses() {
 				b.OnChatResponse(pid, "__agent_starting__", "")
 			}
 
+		case "reasoning":
+			pid, _ := resp["profile_id"].(string)
+			content, _ := resp["content"].(string)
+			msgID, _ := resp["id"].(string)
+			if b.OnChatResponse != nil {
+				b.OnChatResponse(pid, "__reasoning__:"+content, msgID)
+			}
+
 		case "chat":
 			pid, _ := resp["profile_id"].(string)
 			content, _ := resp["content"].(string)

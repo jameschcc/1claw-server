@@ -244,23 +244,52 @@ class HermesBridge:
         _real_stdout = sys.stdout
         try:
             sys.stdout = sys.stderr
-            response = agent.chat(content)
+            # Use run_conversation to get reasoning content
+            result = agent.run_conversation(content)
+        except AttributeError:
+            # Fallback: AIAgent might not have run_conversation (echo agent)
+            try:
+                sys.stdout = sys.stderr
+                result = {"final_response": agent.chat(content), "messages": []}
+            except Exception as e2:
+                log.error("Chat error for %s: %s", pid, e2)
+                self._send({"type": "error", "code": "CHAT_ERROR", "message": str(e2), "id": msg_id})
+                return
         except Exception as e:
             log.error("Chat error for %s: %s", pid, e)
-            self._send({
-                "type": "error",
-                "code": "CHAT_ERROR",
-                "message": str(e),
-                "id": msg_id,
-            })
+            self._send({"type": "error", "code": "CHAT_ERROR", "message": str(e), "id": msg_id})
             return
         finally:
             sys.stdout = _real_stdout
 
+        # Extract reasoning from response
+        if isinstance(result, dict):
+            reasoning = None
+            messages = result.get("messages", [])
+            for m in reversed(messages):
+                if isinstance(m, dict) and m.get("role") == "assistant":
+                    reasoning = m.get("reasoning")
+                    if reasoning:
+                        break
+            if not reasoning:
+                reasoning = result.get("reasoning")
+
+            if reasoning:
+                self._send({
+                    "type": "reasoning",
+                    "profile_id": pid,
+                    "content": reasoning,
+                    "id": msg_id,
+                })
+
+            final = result.get("final_response", result.get("content", str(result)))
+        else:
+            final = str(result)
+
         self._send({
             "type": "chat",
             "profile_id": pid,
-            "content": response,
+            "content": final,
             "id": msg_id,
         })
 
