@@ -48,7 +48,7 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				close(client.send)
+				close(client.Send)
 			}
 			h.mu.Unlock()
 			log.Printf("[ws] client disconnected: %s (total: %d)", client.ID, len(h.clients))
@@ -57,13 +57,13 @@ func (h *Hub) Run() {
 			h.mu.RLock()
 			for client := range h.clients {
 				select {
-				case client.send <- message:
+				case client.Send <- message:
 				default:
 					// Client's send buffer is full, drop the message.
 					h.mu.RUnlock()
 					h.mu.Lock()
 					delete(h.clients, client)
-					close(client.send)
+					close(client.Send)
 					h.mu.Unlock()
 					h.mu.RLock()
 				}
@@ -83,7 +83,7 @@ func (h *Hub) Run() {
 			h.mu.RLock()
 			for client := range h.clients {
 				select {
-				case client.send <- data:
+				case client.Send <- data:
 				default:
 				}
 			}
