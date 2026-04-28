@@ -34,7 +34,10 @@ func TestMockBridge_SendMessage(t *testing.T) {
 	b.LoadProfiles([]model.Profile{profile})
 	b.Start(context.Background(), &profile)
 
-	resp, err := b.SendMessage(context.Background(), "test", "Hello")
+	resp, err := b.SendMessage(context.Background(), model.ChatRequest{
+		ProfileID: "test",
+		Content:   "Hello",
+	})
 	if err != nil {
 		t.Fatalf("SendMessage() error = %v", err)
 	}
@@ -62,7 +65,10 @@ func TestMockBridge_SendOffline(t *testing.T) {
 	b.LoadProfiles([]model.Profile{profile})
 	// Don't start it
 
-	_, err := b.SendMessage(context.Background(), "test", "Hello")
+	_, err := b.SendMessage(context.Background(), model.ChatRequest{
+		ProfileID: "test",
+		Content:   "Hello",
+	})
 	if err == nil {
 		t.Error("expected error when sending to offline profile")
 	}

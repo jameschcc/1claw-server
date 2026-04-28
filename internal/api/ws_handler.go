@@ -38,7 +38,7 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *
 	}
 
 	if hb, ok := bridge.(*agent.HermesBridge); ok {
-		hb.OnChatResponse = func(profileID, content, msgID string) {
+		hb.OnChatResponse = func(profileID, content, msgID, sessionID string) {
 			if content == "__agent_ready__" {
 				profiles := updateProfileStatus(h.Bridge)
 				h.Hub.NotifyProfileUpdate(profiles)
@@ -63,6 +63,19 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *
 					ProfileID: profileID,
 					Content:   reasoningText,
 					ID:        msgID,
+					SessionID: sessionID,
+				}
+				h.Hub.BroadcastJSON(resp)
+				return
+			}
+			if strings.HasPrefix(content, "__cancelled__:") {
+				cancelMessage := strings.TrimPrefix(content, "__cancelled__:")
+				resp := model.WSResponse{
+					Type:      "cancelled",
+					ProfileID: profileID,
+					ID:        msgID,
+					SessionID: sessionID,
+					Message:   cancelMessage,
 				}
 				h.Hub.BroadcastJSON(resp)
 				return
@@ -74,6 +87,7 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *
 				ProfileID: profileID,
 				Content:   content,
 				ID:        msgID,
+				SessionID: sessionID,
 				Timestamp: time.Now().UTC().Format(time.RFC3339),
 			}
 			h.Hub.BroadcastJSON(resp)
@@ -106,6 +120,16 @@ func (h *WSHandler) handleClientMessage(c *ws.Client, msg model.WSMessage) {
 		}
 		h.Hub.NotifyProfileUpdate(profiles)
 
+	case "cancel_chat":
+		if msg.ProfileID == "" {
+			c.SendJSON(model.WSResponse{Type: "error", Code: "missing_profile", Message: "profile_id required"})
+			return
+		}
+		if err := h.Bridge.CancelMessage(msg.ProfileID, msg.SessionID); err != nil {
+			c.SendJSON(model.WSResponse{Type: "error", Code: "cancel_failed", Message: err.Error(), SessionID: msg.SessionID})
+			return
+		}
+
 	default:
 		c.SendJSON(model.WSResponse{Type: "error", Code: "unknown_type", Message: "Unknown: " + msg.Type})
 	}
@@ -131,7 +155,13 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		response, err := h.Bridge.SendMessage(ctx, msg.ProfileID, msg.Content)
+		response, err := h.Bridge.SendMessage(ctx, model.ChatRequest{
+			ProfileID: msg.ProfileID,
+			Content:   msg.Content,
+			ID:        msg.ID,
+			SessionID: msg.SessionID,
+			History:   msg.History,
+		})
 		if err != nil {
 			errMsg := err.Error()
 			if strings.HasPrefix(errMsg, "async:") {
@@ -147,6 +177,7 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			ProfileID: msg.ProfileID,
 			Content:   response,
 			ID:        msg.ID,
+			SessionID: msg.SessionID,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}

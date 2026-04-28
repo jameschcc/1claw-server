@@ -16,7 +16,9 @@ type AgentBridge interface {
 	// Stop terminates a running profile.
 	Stop(profileID string) error
 	// SendMessage sends a user message to the agent and returns the response.
-	SendMessage(ctx context.Context, profileID, message string) (string, error)
+	SendMessage(ctx context.Context, req model.ChatRequest) (string, error)
+	// CancelMessage interrupts the active response for a profile/session.
+	CancelMessage(profileID, sessionID string) error
 	// GetStatus returns the current status of a profile.
 	GetStatus(profileID string) model.AgentStatus
 }
@@ -28,7 +30,8 @@ type Provider interface {
 	StartAll(ctx context.Context) error
 	Start(ctx context.Context, profile *model.Profile) error
 	Stop(profileID string) error
-	SendMessage(ctx context.Context, profileID, message string) (string, error)
+	SendMessage(ctx context.Context, req model.ChatRequest) (string, error)
+	CancelMessage(profileID, sessionID string) error
 	GetStatus(profileID string) model.AgentStatus
 	GetAllStatus() []model.AgentStatus
 	GetProfiles() []model.Profile
@@ -125,7 +128,8 @@ func (b *MockBridge) Stop(profileID string) error {
 }
 
 // SendMessage sends a message and returns a mock response.
-func (b *MockBridge) SendMessage(ctx context.Context, profileID, message string) (string, error) {
+func (b *MockBridge) SendMessage(ctx context.Context, req model.ChatRequest) (string, error) {
+	profileID := req.ProfileID
 	b.mu.RLock()
 	state, exists := b.agents[profileID]
 	b.mu.RUnlock()
@@ -139,7 +143,12 @@ func (b *MockBridge) SendMessage(ctx context.Context, profileID, message string)
 	}
 
 	// Mock response — in production, this calls the real Hermes agent.
-	return fmt.Sprintf("[%s] You said: %s", state.Profile.Name, message), nil
+	return fmt.Sprintf("[%s] You said: %s", state.Profile.Name, req.Content), nil
+}
+
+// CancelMessage is a no-op for the mock bridge.
+func (b *MockBridge) CancelMessage(profileID, sessionID string) error {
+	return nil
 }
 
 // GetStatus returns the profile status.

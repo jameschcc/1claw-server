@@ -28,14 +28,14 @@ type agentProcess struct {
 // HermesBridge manages one subprocess per profile.
 // HermesBridge manages one subprocess per profile.
 type HermesBridge struct {
-	mu       sync.RWMutex
-	agents   map[string]*agentProcess // profile_id → subprocess
-	python   string                   // path to python3
-	script   string                   // path to hermes_agent.py
+	mu         sync.RWMutex
+	agents     map[string]*agentProcess // profile_id → subprocess
+	python     string                   // path to python3
+	script     string                   // path to hermes_agent.py
 	HermesHome string
 
 	// Callback for async chat responses
-	OnChatResponse func(profileID, content, msgID string)
+	OnChatResponse func(profileID, content, msgID, sessionID string)
 }
 
 // NewHermesBridge creates a new per-profile bridge.
@@ -169,7 +169,8 @@ func (b *HermesBridge) Stop(profileID string) error {
 }
 
 // SendMessage sends a chat to the specific profile's process and returns async.
-func (b *HermesBridge) SendMessage(ctx context.Context, profileID, message string) (string, error) {
+func (b *HermesBridge) SendMessage(ctx context.Context, req model.ChatRequest) (string, error) {
+	profileID := req.ProfileID
 	b.mu.RLock()
 	ap, ok := b.agents[profileID]
 	b.mu.RUnlock()
@@ -177,17 +178,50 @@ func (b *HermesBridge) SendMessage(ctx context.Context, profileID, message strin
 		return "", fmt.Errorf("agent %s not running", profileID)
 	}
 
-	msgID := fmt.Sprintf("msg_%d", time.Now().UnixMilli())
-	err := ap.stdin.Encode(map[string]string{
+	msgID := req.ID
+	if msgID == "" {
+		msgID = fmt.Sprintf("msg_%d", time.Now().UnixMilli())
+	}
+
+	payload := map[string]interface{}{
 		"type":    "chat",
-		"content": message,
+		"content": req.Content,
 		"id":      msgID,
-	})
+	}
+	if req.SessionID != "" {
+		payload["session_id"] = req.SessionID
+	}
+	if len(req.History) > 0 {
+		payload["history"] = req.History
+	}
+
+	err := ap.stdin.Encode(payload)
 	if err != nil {
 		return "", fmt.Errorf("send chat: %w", err)
 	}
 
 	return "", fmt.Errorf("async: response via callback")
+}
+
+// CancelMessage interrupts the active response for a profile/session.
+func (b *HermesBridge) CancelMessage(profileID, sessionID string) error {
+	b.mu.RLock()
+	ap, ok := b.agents[profileID]
+	b.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("agent %s not running", profileID)
+	}
+
+	payload := map[string]interface{}{
+		"type": "cancel",
+	}
+	if sessionID != "" {
+		payload["session_id"] = sessionID
+	}
+	if err := ap.stdin.Encode(payload); err != nil {
+		return fmt.Errorf("cancel chat: %w", err)
+	}
+	return nil
 }
 
 // GetStatus returns whether the profile's subprocess is alive.
@@ -278,23 +312,34 @@ func (b *HermesBridge) readAgentResponses(ap *agentProcess) {
 		case "reasoning":
 			content, _ := resp["content"].(string)
 			msgID, _ := resp["id"].(string)
+			sessionID, _ := resp["session_id"].(string)
 			if b.OnChatResponse != nil {
-				b.OnChatResponse(ap.profileID, "__reasoning__:"+content, msgID)
+				b.OnChatResponse(ap.profileID, "__reasoning__:"+content, msgID, sessionID)
 			}
 
 		case "chat":
 			content, _ := resp["content"].(string)
 			msgID, _ := resp["id"].(string)
+			sessionID, _ := resp["session_id"].(string)
 			if b.OnChatResponse != nil {
-				b.OnChatResponse(ap.profileID, content, msgID)
+				b.OnChatResponse(ap.profileID, content, msgID, sessionID)
+			}
+
+		case "cancelled":
+			message, _ := resp["message"].(string)
+			msgID, _ := resp["id"].(string)
+			sessionID, _ := resp["session_id"].(string)
+			if b.OnChatResponse != nil {
+				b.OnChatResponse(ap.profileID, "__cancelled__:"+message, msgID, sessionID)
 			}
 
 		case "error":
 			code, _ := resp["code"].(string)
 			message, _ := resp["message"].(string)
+			sessionID, _ := resp["session_id"].(string)
 			log.Printf("[hermes] %s error [%s]: %s", ap.profileID, code, message)
 			if b.OnChatResponse != nil {
-				b.OnChatResponse(ap.profileID, "__error__:"+message, "")
+				b.OnChatResponse(ap.profileID, "__error__:"+message, "", sessionID)
 			}
 		}
 	}
@@ -333,11 +378,4 @@ func findScript(rel string) string {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

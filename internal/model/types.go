@@ -4,15 +4,15 @@ import "time"
 
 // Profile represents an agent profile configuration.
 type Profile struct {
-	ID            string `json:"id" yaml:"id"`
-	Name          string `json:"name" yaml:"name"`
-	Emoji         string `json:"emoji" yaml:"emoji"`
-	Description   string `json:"description" yaml:"description"`
-	HermesProfile string `json:"hermes_profile" yaml:"hermes_profile"`
-	Color         string `json:"color" yaml:"color"`
-	Online        bool   `json:"online" yaml:"-"`
-	Status        string `json:"status" yaml:"-"`
-	TasksQueue    int    `json:"tasks_queue" yaml:"-"`
+	ID            string    `json:"id" yaml:"id"`
+	Name          string    `json:"name" yaml:"name"`
+	Emoji         string    `json:"emoji" yaml:"emoji"`
+	Description   string    `json:"description" yaml:"description"`
+	HermesProfile string    `json:"hermes_profile" yaml:"hermes_profile"`
+	Color         string    `json:"color" yaml:"color"`
+	Online        bool      `json:"online" yaml:"-"`
+	Status        string    `json:"status" yaml:"-"`
+	TasksQueue    int       `json:"tasks_queue" yaml:"-"`
 	CreatedAt     time.Time `json:"created_at" yaml:"-"`
 	UpdatedAt     time.Time `json:"updated_at" yaml:"-"`
 }
@@ -26,13 +26,30 @@ type ChatMessage struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// ConversationTurn is a minimal chat turn used for history bootstrap.
+type ConversationTurn struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// ChatRequest represents a normalized chat request sent to an agent bridge.
+type ChatRequest struct {
+	ProfileID string
+	Content   string
+	ID        string
+	SessionID string
+	History   []ConversationTurn
+}
+
 // WSMessage represents a WebSocket protocol message.
 type WSMessage struct {
-	Type      string `json:"type"`
-	ProfileID string `json:"profile_id,omitempty"`
-	Content   string `json:"content,omitempty"`
-	ID        string `json:"id,omitempty"`
-	Timestamp string `json:"timestamp,omitempty"`
+	Type      string             `json:"type"`
+	ProfileID string             `json:"profile_id,omitempty"`
+	Content   string             `json:"content,omitempty"`
+	ID        string             `json:"id,omitempty"`
+	SessionID string             `json:"session_id,omitempty"`
+	History   []ConversationTurn `json:"history,omitempty"`
+	Timestamp string             `json:"timestamp,omitempty"`
 }
 
 // WSResponse is the server-to-client response envelope.
@@ -42,6 +59,7 @@ type WSResponse struct {
 	ProfileID string      `json:"profile_id,omitempty"`
 	Content   string      `json:"content,omitempty"`
 	ID        string      `json:"id,omitempty"`
+	SessionID string      `json:"session_id,omitempty"`
 	Timestamp string      `json:"timestamp,omitempty"`
 	Message   string      `json:"message,omitempty"`
 	Code      string      `json:"code,omitempty"`
@@ -51,9 +69,9 @@ type WSResponse struct {
 
 // ServerConfig holds the full server configuration.
 type ServerConfig struct {
-	Server    ServerSettings    `yaml:"server"`
-	WebSocket WSSettings        `yaml:"websocket"`
-	Profiles  []Profile         `yaml:"profiles"`
+	Server    ServerSettings `yaml:"server"`
+	WebSocket WSSettings     `yaml:"websocket"`
+	Profiles  []Profile      `yaml:"profiles"`
 }
 
 // ServerSettings holds HTTP server settings.
