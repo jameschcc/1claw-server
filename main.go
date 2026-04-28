@@ -7,19 +7,22 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"1claw-server/internal/agent"
 	"1claw-server/internal/api"
 	"1claw-server/internal/config"
+	"1claw-server/internal/model"
 	"1claw-server/internal/ws"
 )
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
-	useHermes := flag.Bool("hermes", false, "Use real Hermes AI agents (subprocess bridge)")
+	hermesHome := flag.String("hermes-home", "", "Path to Hermes home (~/.hermes)")
 	flag.Parse()
 
 	// Load configuration
@@ -27,6 +30,61 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// Resolve Hermes home — find via hermes binary symlink
+	hh := *hermesHome
+	if hh == "" {
+		if hermesPath, err := exec.LookPath("hermes"); err == nil {
+			if target, err := filepath.EvalSymlinks(hermesPath); err == nil {
+				// Walk up from binary until we find profiles/ dir
+				dir := filepath.Dir(target)
+				for i := 0; i < 5; i++ {
+					if _, err := os.Stat(filepath.Join(dir, "profiles")); err == nil {
+						hh = dir
+						break
+					}
+					parent := filepath.Dir(dir)
+					if parent == dir {
+						break
+					}
+					dir = parent
+				}
+			}
+		}
+		if hh == "" || hh == "." {
+			hh = filepath.Join(os.Getenv("HOME"), ".hermes")
+		}
+	}
+	log.Printf("Hermes home: %s", hh)
+
+	// Discover user's Hermes profiles
+	userProfiles, err := config.DiscoverProfiles(hh)
+	if err != nil {
+		log.Printf("Warning: could not discover profiles: %v", err)
+	}
+	if len(userProfiles) == 0 {
+		log.Println("Warning: no Hermes profiles found, trying default")
+		defaultProf, _ := config.DiscoverDefaultProfile(hh)
+		if defaultProf != nil {
+			userProfiles = append(userProfiles, *defaultProf)
+		}
+	}
+
+	// Merge: config.yaml profiles override auto-discovered ones
+	profileMap := make(map[string]model.Profile)
+	for _, p := range userProfiles {
+		profileMap[p.ID] = p
+	}
+	for _, p := range cfg.Profiles {
+		profileMap[p.ID] = p
+	}
+
+	// Convert back to slice
+	profiles := make([]model.Profile, 0, len(profileMap))
+	for _, p := range profileMap {
+		profiles = append(profiles, p)
+	}
+	cfg.Profiles = profiles
 
 	// Initialize WebSocket hub
 	hub := ws.NewHub()
@@ -36,16 +94,12 @@ func main() {
 	bridge := agent.NewMockBridge()
 	bridge.LoadProfiles(cfg.Profiles)
 
-	if *useHermes {
-		log.Println("[bridge] Hermes mode requested — falling back to MockBridge (real bridge coming soon)")
-	}
-
 	// Start all agent profiles
 	ctx := context.Background()
 	if err := bridge.StartAll(ctx); err != nil {
 		log.Fatalf("Failed to start agents: %v", err)
 	}
-	log.Printf("Started %d agent profiles (bridge: mock)", len(cfg.Profiles))
+	log.Printf("Loaded %d agent profiles", len(cfg.Profiles))
 
 	// Create API server
 	apiServer := api.NewServer(hub, bridge, cfg)

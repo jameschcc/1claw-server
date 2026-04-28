@@ -9,32 +9,3 @@ websocket:
   write_timeout: 10
   read_timeout: 60
   max_message_size: 65536
-
-profiles:
-  - id: "assistant"
-    name: "AI Assistant"
-    emoji: "🤖"
-    description: "General purpose assistant"
-    hermes_profile: "default"
-    color: "#0078D7"
-
-  - id: "writer"
-    name: "Creative Writer"
-    emoji: "✍️"
-    description: "Helps with writing, editing, and creative content"
-    hermes_profile: "writer"
-    color: "#7B1FA2"
-
-  - id: "coder"
-    name: "Code Expert"
-    emoji: "💻"
-    description: "Programming, debugging, and technical guidance"
-    hermes_profile: "coder"
-    color: "#388E3C"
-
-  - id: "designer"
-    name: "Design Mentor"
-    emoji: "🎨"
-    description: "UI/UX design advice and visual creativity"
-    hermes_profile: "designer"
-    color: "#F57C00"
