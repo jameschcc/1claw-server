@@ -93,7 +93,7 @@ func (h *WSHandler) handleClientMessage(c *ws.Client, msg model.WSMessage) {
 			return
 		}
 		if hb, ok := h.Bridge.(*agent.HermesBridge); ok {
-			hb.SendRaw(map[string]interface{}{
+			hb.SendRaw(pid, map[string]interface{}{
 				"type":       "start_profile",
 				"profile_id": pid,
 			})

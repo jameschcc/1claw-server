@@ -69,7 +69,6 @@ func main() {
 
 	// Initialize agent bridge
 	var bridge agent.Provider
-	var pythonPath string
 
 	if *useMock || !hermesAvailable() {
 		if *useMock {
@@ -81,32 +80,28 @@ func main() {
 		mb.LoadProfiles(cfg.Profiles)
 		bridge = mb
 	} else {
-		log.Println("[bridge] Starting Hermes Python bridge ...")
-		// Find the Hermes venv python
-		pythonPath = filepath.Join(hh, "hermes-agent", "venv", "bin", "python3")
-		if _, err := os.Stat(pythonPath); os.IsNotExist(err) {
-			log.Printf("Warning: Hermes python not found at %s, falling back to MockBridge", pythonPath)
-			mb := agent.NewMockBridge()
-			mb.LoadProfiles(cfg.Profiles)
-			bridge = mb
-		} else {
-			scriptPath := filepath.Join(findServerDir(), "scripts", "hermes_bridge.py")
-			hb := agent.NewHermesBridge()
-			hb.LoadProfiles(cfg.Profiles)
-			subCtx := context.Background()
-			if err := hb.StartSubprocess(subCtx, pythonPath, scriptPath); err != nil {
-				log.Printf("Warning: failed to start Hermes bridge: %v, falling back to MockBridge", err)
-				mb := agent.NewMockBridge()
-				mb.LoadProfiles(cfg.Profiles)
-				bridge = mb
-			} else {
-				// Send profiles to the bridge now that stdin is ready
-				if err := hb.SendInit(); err != nil {
-					log.Printf("Warning: failed to init Hermes bridge: %v", err)
-				}
-				bridge = hb
+		log.Println("[bridge] Starting per-profile Hermes agents ...")
+		hb := agent.NewHermesBridge()
+		hb.HermesHome = hh
+		hb.Init()
+
+		// Spawn one process per profile
+		for _, p := range cfg.Profiles {
+			if err := hb.SpawnProfile(p.ID); err != nil {
+				log.Printf("Warning: failed to spawn agent %s: %v", p.ID, err)
 			}
 		}
+
+		// Wait for all to be ready (background)
+		go func() {
+			for _, p := range cfg.Profiles {
+				if err := hb.WaitReady(p.ID, 120*time.Second); err != nil {
+					log.Printf("Warning: %s not ready: %v", p.ID, err)
+				}
+			}
+		}()
+
+		bridge = hb
 	}
 
 	// Start all agent profiles
@@ -178,25 +173,6 @@ func main() {
 func hermesAvailable() bool {
 	_, err := exec.LookPath("hermes")
 	return err == nil
-}
-
-func findServerDir() string {
-	// Try to find the server dir relative to the binary
-	exe, err := os.Executable()
-	if err == nil {
-		dir := filepath.Dir(exe)
-		// Check if scripts/ exists next to the binary
-		if _, err := os.Stat(filepath.Join(dir, "scripts")); err == nil {
-			return dir
-		}
-		// Check parent
-		parent := filepath.Dir(dir)
-		if _, err := os.Stat(filepath.Join(parent, "scripts")); err == nil {
-			return parent
-		}
-	}
-	// Fallback
-	return "/home/j/Codes/1claw/1claw-server"
 }
 
 func bridgeType(b agent.Provider) string {

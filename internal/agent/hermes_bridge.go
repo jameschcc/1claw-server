@@ -8,188 +8,196 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"1claw-server/internal/model"
 )
 
-// HermesBridge implements AgentBridge by spawning a Python subprocess
-// that uses real AIAgent.chat() from the Hermes codebase.
-type HermesBridge struct {
-	cmd      *exec.Cmd
-	stdin    *json.Encoder
-	stdout   *bufio.Scanner
-	mu       sync.RWMutex
-	profiles map[string]*model.Profile
-	agents   map[string]bool // profile_id → loaded
-	ready    chan struct{}
-	stopCh   chan struct{}
+// agentProcess represents a single persistent Hermes agent subprocess.
+type agentProcess struct {
+	cmd       *exec.Cmd
+	stdin     *json.Encoder
+	stdout    *bufio.Scanner
+	profileID string
+	ready     bool
+	mu        sync.Mutex
+}
 
-	// OnChatResponse is called when the Python bridge responds to a chat.
-	// Set by the WS handler to route responses to WebSocket clients.
+// HermesBridge manages one subprocess per profile.
+// HermesBridge manages one subprocess per profile.
+type HermesBridge struct {
+	mu       sync.RWMutex
+	agents   map[string]*agentProcess // profile_id → subprocess
+	python   string                   // path to python3
+	script   string                   // path to hermes_agent.py
+	HermesHome string
+
+	// Callback for async chat responses
 	OnChatResponse func(profileID, content, msgID string)
 }
 
-// NewHermesBridge creates a new bridge connected to the Hermes Python subprocess.
+// NewHermesBridge creates a new per-profile bridge.
 func NewHermesBridge() *HermesBridge {
 	return &HermesBridge{
-		profiles: make(map[string]*model.Profile),
-		agents:   make(map[string]bool),
-		ready:    make(chan struct{}),
-		stopCh:   make(chan struct{}),
+		agents: make(map[string]*agentProcess),
 	}
 }
 
-// StartSubprocess launches the Hermes Python bridge subprocess.
-// pythonPath: path to the Hermes venv python (e.g., ~/.hermes/hermes-agent/venv/bin/python3)
-// scriptPath: path to hermes_bridge.py
-func (b *HermesBridge) StartSubprocess(ctx context.Context, pythonPath, scriptPath string) error {
+// Init sets paths and discovers python/hermes-home.
+func (b *HermesBridge) Init() {
+	b.python = filepath.Join(b.HermesHome, "hermes-agent", "venv", "bin", "python3")
+	b.script = findScript("scripts/hermes_agent.py")
+	if b.python == "" || !fileExists(b.python) {
+		b.python = "python3"
+	}
+	log.Printf("[hermes] python=%s script=%s hermes-home=%s", b.python, b.script, b.HermesHome)
+}
+
+// SpawnProfile starts a subprocess for a single profile.
+func (b *HermesBridge) SpawnProfile(pid string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.cmd != nil {
-		return fmt.Errorf("bridge already running")
+	if _, exists := b.agents[pid]; exists {
+		return nil // already running
 	}
 
-	b.cmd = exec.CommandContext(ctx, pythonPath, scriptPath)
+	ap := &agentProcess{profileID: pid}
+	ctx := context.Background()
+	ap.cmd = exec.CommandContext(ctx, b.python, b.script)
 
-	// Stdin pipe for sending commands
-	stdinPipe, err := b.cmd.StdinPipe()
+	// Set profile-specific environment
+	ap.cmd.Env = os.Environ()
+	ap.cmd.Env = append(ap.cmd.Env, "HERMES_PROFILE="+pid)
+	ap.cmd.Env = append(ap.cmd.Env, "HERMES_HOME="+b.HermesHome)
+
+	// Stdin pipe
+	stdinPipe, err := ap.cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("stdin pipe: %w", err)
 	}
-	b.stdin = json.NewEncoder(stdinPipe)
+	ap.stdin = json.NewEncoder(stdinPipe)
 
-	// Stdout pipe for reading responses
-	stdoutPipe, err := b.cmd.StdoutPipe()
+	// Stdout pipe
+	stdoutPipe, err := ap.cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
-	b.stdout = bufio.NewScanner(stdoutPipe)
-	b.stdout.Buffer(make([]byte, 0, 256*1024), 256*1024)
+	ap.stdout = bufio.NewScanner(stdoutPipe)
+	ap.stdout.Buffer(make([]byte, 0, 256*1024), 256*1024)
 
-	// Stderr goes to our log
-	b.cmd.Stderr = os.Stderr
+	ap.cmd.Stderr = os.Stderr
 
-	if err := b.cmd.Start(); err != nil {
-		return fmt.Errorf("start subprocess: %w", err)
+	if err := ap.cmd.Start(); err != nil {
+		return fmt.Errorf("start agent %s: %w", pid, err)
 	}
 
-	log.Printf("[hermes] bridge subprocess started (pid=%d)", b.cmd.Process.Pid)
+	b.agents[pid] = ap
+	log.Printf("[hermes] spawned agent %s (pid=%d)", pid, ap.cmd.Process.Pid)
 
-	// Start reading responses in background
-	go b.readResponses()
+	// Read responses in background
+	go b.readAgentResponses(ap)
 
 	return nil
 }
 
-// LoadProfiles stores profile configurations (queued for send after subprocess starts).
-func (b *HermesBridge) LoadProfiles(profiles []model.Profile) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, p := range profiles {
-		prof := p
-		b.profiles[p.ID] = &prof
-	}
-}
-
-// SendInit sends the init command to the Python bridge with all loaded profiles.
-// Must be called after StartSubprocess.
-func (b *HermesBridge) SendInit() error {
+// WaitReady blocks until the agent subprocess sends "ready".
+func (b *HermesBridge) WaitReady(pid string, timeout time.Duration) error {
 	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	profileList := make([]map[string]interface{}, 0, len(b.profiles))
-	for _, p := range b.profiles {
-		profileList = append(profileList, map[string]interface{}{
-			"id":             p.ID,
-			"name":           p.Name,
-			"emoji":          p.Emoji,
-			"description":    p.Description,
-			"hermes_profile": p.HermesProfile,
-			"color":          p.Color,
-		})
+	ap, ok := b.agents[pid]
+	b.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("agent %s not found", pid)
 	}
 
-	err := b.send(map[string]interface{}{
-		"type":     "init",
-		"profiles": profileList,
-	})
-	return err
-}
-
-// waitReady blocks until the bridge sends "ready".
-func (b *HermesBridge) waitReady(timeout time.Duration) error {
-	select {
-	case <-b.ready:
-		return nil
-	case <-time.After(timeout):
-		return fmt.Errorf("bridge not ready after %v", timeout)
+	deadline := time.After(timeout)
+	for {
+		ap.mu.Lock()
+		ready := ap.ready
+		ap.mu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-deadline:
+			return fmt.Errorf("agent %s not ready after %v", pid, timeout)
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
-// StartAll implements AgentBridge: sends init, waits for ready.
-// For the subprocess bridge, profiles must already be loaded.
-func (b *HermesBridge) Start(ctx context.Context, profile *model.Profile) error {
-	b.mu.Lock()
-	b.agents[profile.ID] = true
-	b.mu.Unlock()
-	return nil
-}
+// LoadProfiles stores profile list (no-op for per-process bridge).
+func (b *HermesBridge) LoadProfiles(profiles []model.Profile) {}
 
-// StartAll waits for the bridge to be ready and marks all profiles as online.
+// StartAll spawns one subprocess per profile.
 func (b *HermesBridge) StartAll(ctx context.Context) error {
-	if err := b.waitReady(60 * time.Second); err != nil {
-		return err
+	b.mu.RLock()
+	pids := make([]string, 0, len(b.agents))
+	for pid := range b.agents {
+		pids = append(pids, pid)
 	}
-	// Mark all profiles as online
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for id := range b.profiles {
-		b.agents[id] = true
+	b.mu.RUnlock()
+
+	for _, pid := range pids {
+		if err := b.WaitReady(pid, 120*time.Second); err != nil {
+			log.Printf("[hermes] %s", err)
+		}
 	}
 	return nil
 }
 
-// Stop implements AgentBridge.
+// Start implements Provider interface (marks as loaded).
+func (b *HermesBridge) Start(ctx context.Context, profile *model.Profile) error {
+	return b.SpawnProfile(profile.ID)
+}
+
+// Stop kills a profile's subprocess.
 func (b *HermesBridge) Stop(profileID string) error {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	ap, ok := b.agents[profileID]
+	if !ok {
+		return nil
+	}
 	delete(b.agents, profileID)
-	b.mu.Unlock()
+	if ap.cmd != nil && ap.cmd.Process != nil {
+		return ap.cmd.Process.Kill()
+	}
 	return nil
 }
 
-// SendMessage sends a chat message to the specified profile via the Python bridge.
+// SendMessage sends a chat to the specific profile's process and returns async.
 func (b *HermesBridge) SendMessage(ctx context.Context, profileID, message string) (string, error) {
-	msgID := fmt.Sprintf("msg_%d", time.Now().UnixMilli())
+	b.mu.RLock()
+	ap, ok := b.agents[profileID]
+	b.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("agent %s not running", profileID)
+	}
 
-	err := b.send(map[string]interface{}{
-		"type":       "chat",
-		"profile_id": profileID,
-		"content":    message,
-		"id":         msgID,
+	msgID := fmt.Sprintf("msg_%d", time.Now().UnixMilli())
+	err := ap.stdin.Encode(map[string]string{
+		"type":    "chat",
+		"content": message,
+		"id":      msgID,
 	})
 	if err != nil {
 		return "", fmt.Errorf("send chat: %w", err)
 	}
 
-	// The response will arrive asynchronously via readResponses.
-	// We store a pending channel to wait for the specific response.
-	// For simplicity: return a pending indicator — the response is
-	// routed back through the WS handler directly.
-	return "", fmt.Errorf("async: response will be routed via WebSocket")
+	return "", fmt.Errorf("async: response via callback")
 }
 
-// GetStatus returns the current status of a profile.
+// GetStatus returns whether the profile's subprocess is alive.
 func (b *HermesBridge) GetStatus(profileID string) model.AgentStatus {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	_, loaded := b.agents[profileID]
-	_, exists := b.profiles[profileID]
+	_, ok := b.agents[profileID]
 	return model.AgentStatus{
 		ProfileID: profileID,
-		Online:    loaded && exists,
+		Online:    ok,
 	}
 }
 
@@ -197,127 +205,139 @@ func (b *HermesBridge) GetStatus(profileID string) model.AgentStatus {
 func (b *HermesBridge) GetAllStatus() []model.AgentStatus {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	statuses := make([]model.AgentStatus, 0, len(b.profiles))
-	for id := range b.profiles {
-		_, loaded := b.agents[id]
+	statuses := make([]model.AgentStatus, 0, len(b.agents))
+	for pid := range b.agents {
 		statuses = append(statuses, model.AgentStatus{
-			ProfileID: id,
-			Online:    loaded,
+			ProfileID: pid,
+			Online:    true,
 		})
 	}
 	return statuses
 }
 
-// GetProfiles returns all registered profiles.
+// GetProfiles returns all managed profile IDs as profiles.
 func (b *HermesBridge) GetProfiles() []model.Profile {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	profiles := make([]model.Profile, 0, len(b.profiles))
-	for _, p := range b.profiles {
-		profiles = append(profiles, *p)
+	profiles := make([]model.Profile, 0, len(b.agents))
+	for pid := range b.agents {
+		profiles = append(profiles, model.Profile{
+			ID:     pid,
+			Name:   pid,
+			Online: true,
+		})
 	}
 	return profiles
 }
 
-// Close shuts down the Python bridge subprocess.
+// Close kills all subprocesses.
 func (b *HermesBridge) Close() error {
-	_ = b.send(map[string]string{"type": "shutdown"})
-	close(b.stopCh)
-	if b.cmd != nil && b.cmd.Process != nil {
-		return b.cmd.Wait()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for pid, ap := range b.agents {
+		if ap.cmd != nil && ap.cmd.Process != nil {
+			ap.cmd.Process.Kill()
+		}
+		delete(b.agents, pid)
 	}
 	return nil
 }
 
-// SendRaw sends an arbitrary JSON command to the Python bridge.
-func (b *HermesBridge) SendRaw(v map[string]interface{}) {
-	if err := b.send(v); err != nil {
-		log.Printf("[hermes] send error: %v", err)
+// SendRaw sends an arbitrary JSON command to a specific profile's process.
+func (b *HermesBridge) SendRaw(profileID string, v map[string]interface{}) {
+	b.mu.RLock()
+	ap, ok := b.agents[profileID]
+	b.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if err := ap.stdin.Encode(v); err != nil {
+		log.Printf("[hermes] send to %s: %v", profileID, err)
 	}
 }
 
 // --- internal ---
 
-func (b *HermesBridge) send(v interface{}) error {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if b.stdin == nil {
-		return fmt.Errorf("bridge not started")
-	}
-	return b.stdin.Encode(v)
-}
-
-func (b *HermesBridge) readResponses() {
-	for b.stdout.Scan() {
-		line := b.stdout.Text()
+func (b *HermesBridge) readAgentResponses(ap *agentProcess) {
+	for ap.stdout.Scan() {
+		line := ap.stdout.Text()
 		var resp map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &resp); err != nil {
-			log.Printf("[hermes] parse error: %v", err)
+			log.Printf("[hermes] %s parse error: %v", ap.profileID, err)
 			continue
 		}
 
 		msgType, _ := resp["type"].(string)
-		log.Printf("[hermes] response: type=%s", msgType)
-
 		switch msgType {
 		case "ready":
-			profileCount, _ := resp["profile_count"].(float64)
-			log.Printf("[hermes] bridge ready with %.0f profiles", profileCount)
-			close(b.ready)
-
-		case "agent_ready":
-			pid, _ := resp["profile_id"].(string)
-			status, _ := resp["status"].(string)
-			log.Printf("[hermes] agent %s is %s", pid, status)
-			if b.OnChatResponse != nil && status == "real" {
-				b.OnChatResponse(pid, "__agent_ready__", "")
-			}
-
-		case "agent_starting":
-			pid, _ := resp["profile_id"].(string)
-			log.Printf("[hermes] agent %s starting...", pid)
-			if b.OnChatResponse != nil {
-				b.OnChatResponse(pid, "__agent_starting__", "")
-			}
+			ap.mu.Lock()
+			ap.ready = true
+			ap.mu.Unlock()
+			log.Printf("[hermes] agent %s ready", ap.profileID)
 
 		case "reasoning":
-			pid, _ := resp["profile_id"].(string)
 			content, _ := resp["content"].(string)
 			msgID, _ := resp["id"].(string)
 			if b.OnChatResponse != nil {
-				b.OnChatResponse(pid, "__reasoning__:"+content, msgID)
+				b.OnChatResponse(ap.profileID, "__reasoning__:"+content, msgID)
 			}
 
 		case "chat":
-			pid, _ := resp["profile_id"].(string)
 			content, _ := resp["content"].(string)
 			msgID, _ := resp["id"].(string)
 			if b.OnChatResponse != nil {
-				b.OnChatResponse(pid, content, msgID)
-			}
-
-		case "status":
-			profilesRaw, ok := resp["profiles"].([]interface{})
-			if ok {
-				log.Printf("[hermes] status: %d profiles", len(profilesRaw))
+				b.OnChatResponse(ap.profileID, content, msgID)
 			}
 
 		case "error":
 			code, _ := resp["code"].(string)
 			message, _ := resp["message"].(string)
-			log.Printf("[hermes] error [%s]: %s", code, message)
+			log.Printf("[hermes] %s error [%s]: %s", ap.profileID, code, message)
+			if b.OnChatResponse != nil {
+				b.OnChatResponse(ap.profileID, "__error__:"+message, "")
+			}
 		}
 	}
 
-	if err := b.stdout.Err(); err != nil {
-		log.Printf("[hermes] stdout error: %v", err)
+	if err := ap.stdout.Err(); err != nil {
+		log.Printf("[hermes] %s stdout error: %v", ap.profileID, err)
 	}
-	log.Println("[hermes] bridge stdout closed")
+	log.Printf("[hermes] agent %s process exited", ap.profileID)
 }
 
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+func findScript(rel string) string {
+	// Try relative to executable
+	exe, err := os.Executable()
+	if err == nil {
+		dir := filepath.Dir(exe)
+		if fileExists(filepath.Join(dir, rel)) {
+			return filepath.Join(dir, rel)
+		}
+		if fileExists(filepath.Join(filepath.Dir(dir), rel)) {
+			return filepath.Join(filepath.Dir(dir), rel)
+		}
+	}
+	// Try absolute fallback
+	candidates := []string{
+		"/home/j/Codes/1claw/1claw-server/" + rel,
+		filepath.Join(os.Getenv("HOME"), "Codes/1claw/1claw-server", rel),
+	}
+	for _, c := range candidates {
+		if fileExists(c) {
+			return c
+		}
+	}
+	return rel
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
 		return s
 	}
-	return s[:maxLen] + "..."
+	return s[:n] + "..."
 }
