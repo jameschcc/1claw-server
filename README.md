@@ -10,18 +10,21 @@ Mobile Client (WS) <-> Go Gateway (this server) <-> Agent Profiles (Hermes)
 
 ## Quick Start
 
-### Prerequisites
-- Go 1.22+
-- Or Docker
+### China users (no VPN)
+```bash
+cd 1claw-server
+make build   # uses goproxy.cn automatically
+./1claw-server -config=config.yaml
+```
 
-### Run with Go
+### International
 ```bash
 cd 1claw-server
 go mod tidy
 go run . -config=config.yaml
 ```
 
-### Run with Docker
+### Docker
 ```bash
 docker build -t 1claw-server .
 docker run -p 8080:8080 1claw-server
