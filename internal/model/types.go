@@ -11,6 +11,8 @@ type Profile struct {
 	HermesProfile string `json:"hermes_profile" yaml:"hermes_profile"`
 	Color         string `json:"color" yaml:"color"`
 	Online        bool   `json:"online" yaml:"-"`
+	Status        string `json:"status" yaml:"-"`
+	TasksQueue    int    `json:"tasks_queue" yaml:"-"`
 	CreatedAt     time.Time `json:"created_at" yaml:"-"`
 	UpdatedAt     time.Time `json:"updated_at" yaml:"-"`
 }
