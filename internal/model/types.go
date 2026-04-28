@@ -46,6 +46,7 @@ type WSResponse struct {
 	Message   string      `json:"message,omitempty"`
 	Code      string      `json:"code,omitempty"`
 	Data      interface{} `json:"data,omitempty"`
+	Title     string      `json:"title,omitempty"`
 }
 
 // ServerConfig holds the full server configuration.

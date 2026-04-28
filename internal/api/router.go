@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"time"
 
 	"1claw-server/internal/agent"
 	"1claw-server/internal/model"
@@ -42,6 +43,9 @@ func (s *Server) registerRoutes() {
 	api.HandleFunc("/profiles", s.handleCreateProfile).Methods("POST")
 	api.HandleFunc("/profiles/{id}", s.handleUpdateProfile).Methods("PUT")
 	api.HandleFunc("/profiles/{id}", s.handleDeleteProfile).Methods("DELETE")
+
+	// Notify all connected clients
+	api.HandleFunc("/notify", s.handleNotify).Methods("POST")
 
 	// Health check
 	s.Router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +153,57 @@ func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "id": id})
+}
+
+// NotifyRequest is the request body for sending a notification to all users.
+type NotifyRequest struct {
+	Title   string `json:"title"`
+	Content string `json:"content"`
+}
+
+// handleNotify sends a broadcast notification to all connected WebSocket clients.
+func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
+	var req NotifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Content == "" {
+		http.Error(w, `{"error":"content is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	resp := model.WSResponse{
+		Type:      "notification",
+		Title:     req.Title,
+		Content:   req.Content,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if err := s.Hub.BroadcastJSON(resp); err != nil {
+		log.Printf("[notify] broadcast error: %v", err)
+		http.Error(w, `{"error":"broadcast failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	clientCount := s.Hub.ClientCount()
+	log.Printf("[notify] broadcast notification to %d clients: %s", clientCount, truncate(req.Content, 80))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":       "sent",
+		"clients":      clientCount,
+		"title":        req.Title,
+		"content":      req.Content,
+		"timestamp":    resp.Timestamp,
+	})
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 // corsMiddleware adds CORS headers.
