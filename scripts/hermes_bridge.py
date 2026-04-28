@@ -123,6 +123,31 @@ class HermesBridge:
         self.agents[pid] = echo
         return echo
 
+    def _load_profile_config(self, pid):
+        """Load profile config.yaml and return model settings."""
+        hermes_home = find_hermes_home()
+        if not hermes_home:
+            return {}
+        cfg_path = os.path.join(hermes_home, "profiles", pid, "config.yaml")
+        if pid == "default":
+            cfg_path = os.path.join(hermes_home, "config.yaml")
+        if not os.path.isfile(cfg_path):
+            return {}
+        try:
+            import yaml
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f)
+            model_cfg = cfg.get("model", {}) if cfg else {}
+            return {
+                "provider": model_cfg.get("provider", ""),
+                "model": model_cfg.get("default", ""),
+                "base_url": model_cfg.get("base_url", ""),
+                "api_key": model_cfg.get("api_key", ""),
+            }
+        except Exception as e:
+            log.warning("Config load failed for %s: %s", pid, e)
+            return {}
+
     def _init_real_agent(self, p):
         """Initialize a real AIAgent for a profile (runs in background thread)."""
         pid = p.get("id", "")
@@ -134,12 +159,18 @@ class HermesBridge:
             profile_env = os.path.join(hermes_home, "profiles", pid, ".env")
             load_env_file(profile_env)
 
+        # Load profile config for model settings
+        cfg = self._load_profile_config(pid)
+
         # Redirect AIAgent's stdout chatter to stderr, keep _send on real stdout
         _real_stdout = sys.stdout
         try:
             sys.stdout = sys.stderr
             agent = AIAgent(
-                model="deepseek-v4-flash",
+                provider=cfg.get("provider", ""),
+                model=cfg.get("model", "deepseek-v4-flash"),
+                base_url=cfg.get("base_url", ""),
+                api_key=cfg.get("api_key", None),
                 skip_memory=True,
                 skip_context_files=True,
                 quiet_mode=True,
