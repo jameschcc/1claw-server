@@ -71,6 +71,20 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig, c
 				h.Hub.BroadcastJSON(resp)
 				return
 			}
+			if strings.HasPrefix(content, "__chunk__:") {
+				chunkContent := strings.TrimPrefix(content, "__chunk__:")
+				resp := model.WSResponse{
+					Type:      "chat_chunk",
+					ProfileID: profileID,
+					Content:   chunkContent,
+					ID:        msgID,
+					SessionID: sessionID,
+					Timestamp: time.Now().UTC().Format(time.RFC3339),
+				}
+				h.Hub.BroadcastJSON(resp)
+				return
+			}
+
 			if strings.HasPrefix(content, "__cancelled__:") {
 				cancelMessage := strings.TrimPrefix(content, "__cancelled__:")
 				resp := model.WSResponse{
@@ -98,6 +112,18 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig, c
 			// Persist agent response to all active conversations
 			h.persistChatToAll(profileID, "agent", content, msgID)
 		}
+
+		hb.OnChatDispatched = func(profileID, msgID, sessionID string) {
+			resp := model.WSResponse{
+				Type:      "thinking",
+				ProfileID: profileID,
+				ID:        msgID,
+				SessionID: sessionID,
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			}
+			h.Hub.BroadcastJSON(resp)
+		}
+
 		log.Println("[ws] Hermes bridge async response routing enabled")
 	}
 
@@ -229,7 +255,7 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Also save to the agent's conversation context
+		// Forward to agent
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 

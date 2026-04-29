@@ -99,7 +99,7 @@ def main():
                 continue
             role = str(entry.get("role", "")).strip()
             content = entry.get("content", "")
-            if role not in ("user", "assistant") or not isinstance(content, str):
+            if role not in ("agent", "user", "assistant") or not isinstance(content, str):
                 continue
             content = content.strip()
             if not content:
@@ -163,12 +163,38 @@ def main():
                 elif history:
                     conversation_history = history
 
+            # Streaming: accumulate text deltas and send per-chunk "chat" messages
+            streamed_chunks = []
+
+            def on_stream_delta(text: str):
+                streamed_chunks.append(text)
+                full_text = ''.join(streamed_chunks)
+                send({
+                    "type": "chat_chunk",
+                    "content": full_text,
+                    "id": msg_id,
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                })
+
+            def on_reasoning_delta(text: str):
+                send({
+                    "type": "reasoning",
+                    "content": text,
+                    "id": msg_id,
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                })
+
+            agent.reasoning_callback = on_reasoning_delta
+
             _real_stdout = sys.stdout
             try:
                 sys.stdout = sys.stderr
                 result = agent.run_conversation(
                     content,
                     conversation_history=conversation_history,
+                    stream_callback=on_stream_delta,
                 )
             finally:
                 sys.stdout = _real_stdout
@@ -199,23 +225,9 @@ def main():
         if run_state.get("cancelled"):
             return
 
+        # Reasoning and final chat were already streamed via callbacks.
+        # Send the final complete response to guarantee delivery.
         if isinstance(result, dict):
-            reasoning = None
-            for message in reversed(result.get("messages", [])):
-                if isinstance(message, dict) and message.get("role") == "assistant":
-                    reasoning = message.get("reasoning")
-                    if reasoning:
-                        break
-            if not reasoning:
-                reasoning = result.get("reasoning")
-            if reasoning:
-                send({
-                    "type": "reasoning",
-                    "content": reasoning,
-                    "id": msg_id,
-                    "profile_id": profile_id,
-                    "session_id": session_id,
-                })
             final = result.get("final_response", result.get("content", str(result)))
         else:
             final = str(result)

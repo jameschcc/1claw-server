@@ -36,6 +36,11 @@ type HermesBridge struct {
 
 	// Callback for async chat responses
 	OnChatResponse func(profileID, content, msgID, sessionID string)
+
+	// Callback fired when a message has been successfully dispatched to the agent
+	// subprocess. The frontend can show a "thinking" indicator at this point
+	// without waiting for the first response chunk.
+	OnChatDispatched func(profileID, msgID, sessionID string)
 }
 
 // NewHermesBridge creates a new per-profile bridge.
@@ -200,6 +205,13 @@ func (b *HermesBridge) SendMessage(ctx context.Context, req model.ChatRequest) (
 		return "", fmt.Errorf("send chat: %w", err)
 	}
 
+	// Notify that the message has been dispatched to the agent subprocess.
+	// The frontend can show a "thinking" indicator immediately without waiting
+	// for the first response stream chunk.
+	if b.OnChatDispatched != nil {
+		b.OnChatDispatched(profileID, msgID, req.SessionID)
+	}
+
 	return "", fmt.Errorf("async: response via callback")
 }
 
@@ -315,6 +327,14 @@ func (b *HermesBridge) readAgentResponses(ap *agentProcess) {
 			sessionID, _ := resp["session_id"].(string)
 			if b.OnChatResponse != nil {
 				b.OnChatResponse(ap.profileID, "__reasoning__:"+content, msgID, sessionID)
+			}
+
+		case "chat_chunk":
+			content, _ := resp["content"].(string)
+			msgID, _ := resp["id"].(string)
+			sessionID, _ := resp["session_id"].(string)
+			if b.OnChatResponse != nil {
+				b.OnChatResponse(ap.profileID, "__chunk__:"+content, msgID, sessionID)
 			}
 
 		case "chat":
