@@ -135,7 +135,12 @@ func (c *Client) handleMessage(msg model.WSMessage) {
 		log.Printf("[ws] client %s switched to profile %s", c.ID, msg.ProfileID)
 
 	case "get_status":
-		c.sendPong()
+		// Forward to generic handler so it can reply with full profile list
+		if c.OnMessage != nil {
+			c.OnMessage(c, msg)
+		} else {
+			c.sendPong()
+		}
 
 	case "get_history":
 		if c.OnHistoryRequest != nil {

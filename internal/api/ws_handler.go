@@ -183,6 +183,14 @@ func (h *WSHandler) handleClientMessage(c *ws.Client, msg model.WSMessage) {
 			return
 		}
 
+	case "get_status":
+		// Re-read profiles from bridge and send status to the requesting client
+		profiles := updateProfileStatus(h.Bridge)
+		c.SendJSON(model.WSResponse{
+			Type:     "status",
+			Profiles: profiles,
+		})
+
 	default:
 		c.SendJSON(model.WSResponse{Type: "error", Code: "unknown_type", Message: "Unknown: " + msg.Type})
 	}

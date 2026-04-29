@@ -150,6 +150,24 @@ func main() {
 		}
 	}()
 
+	// Periodic profile refresh every 30 minutes — reloads from bridge
+	// and broadcasts to all connected clients so front-ends pick up
+	// profile additions / deletions without manual refresh.
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			profiles := bridge.GetProfiles()
+			for i := range profiles {
+				st := bridge.GetStatus(profiles[i].ID)
+				profiles[i].Online = st.Online
+			}
+			hub.NotifyProfileUpdate(profiles)
+			log.Printf("[periodic] broadcast profile status to %d clients (%d profiles)",
+				hub.ClientCount(), len(profiles))
+		}
+	}()
+
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
