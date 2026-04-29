@@ -98,11 +98,15 @@ def main():
             if not isinstance(entry, dict):
                 continue
             role = str(entry.get("role", "")).strip()
+            if role == "agent":
+                role = "assistant"
             content = entry.get("content", "")
             if not isinstance(content, str):
                 continue
             content = content.strip()
             if not content:
+                continue
+            if role not in ("system", "user", "assistant"):
                 continue
             normalized.append({"role": role, "content": content})
         return normalized
