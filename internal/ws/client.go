@@ -30,9 +30,13 @@ type Client struct {
 	Conn   *websocket.Conn
 	Send   chan []byte
 	ActiveProfile string
+	ConversationID string
 
 	// Handler for incoming chat messages.
 	OnChat func(client *Client, msg model.WSMessage)
+
+	// Handler for history requests.
+	OnHistoryRequest func(client *Client)
 
 	// Handler for other incoming messages (start_profile, etc.)
 	OnMessage func(client *Client, msg model.WSMessage)
@@ -132,6 +136,13 @@ func (c *Client) handleMessage(msg model.WSMessage) {
 
 	case "get_status":
 		c.sendPong()
+
+	case "get_history":
+		if c.OnHistoryRequest != nil {
+			c.OnHistoryRequest(c)
+		} else {
+			c.sendError("not_ready", "History not available")
+		}
 
 	default:
 		// Forward to generic handler

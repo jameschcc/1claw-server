@@ -12,6 +12,8 @@ import (
 type Hub struct {
 	// Registered clients.
 	clients map[*Client]bool
+	// Client lookup by ID.
+	clientByID map[string]*Client
 	// Register requests.
 	register chan *Client
 	// Unregister requests.
@@ -27,6 +29,7 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{
 		clients:        make(map[*Client]bool),
+		clientByID:     make(map[string]*Client),
 		register:       make(chan *Client),
 		unregister:     make(chan *Client),
 		broadcast:      make(chan []byte, 256),
@@ -41,6 +44,9 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
+			if client.ID != "" {
+				h.clientByID[client.ID] = client
+			}
 			h.mu.Unlock()
 			log.Printf("[ws] client connected: %s (total: %d)", client.ID, len(h.clients))
 
@@ -48,6 +54,9 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
+				if client.ID != "" {
+					delete(h.clientByID, client.ID)
+				}
 				close(client.Send)
 			}
 			h.mu.Unlock()
@@ -122,4 +131,31 @@ func (h *Hub) ClientCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.clients)
+}
+
+// SendToClient sends raw bytes to a specific client by ID.
+// Returns false if the client is not connected.
+func (h *Hub) SendToClient(clientID string, data []byte) bool {
+	h.mu.RLock()
+	client, ok := h.clientByID[clientID]
+	h.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	select {
+	case client.Send <- data:
+		return true
+	default:
+		return false
+	}
+}
+
+// SendJSONToClient sends a JSON-serializable response to a specific client by ID.
+func (h *Hub) SendJSONToClient(clientID string, v interface{}) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	h.SendToClient(clientID, data)
+	return nil
 }

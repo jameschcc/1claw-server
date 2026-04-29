@@ -16,6 +16,7 @@ import (
 	"1claw-server/internal/agent"
 	"1claw-server/internal/api"
 	"1claw-server/internal/config"
+	"1claw-server/internal/store"
 	"1claw-server/internal/ws"
 )
 
@@ -111,9 +112,19 @@ func main() {
 	}
 	log.Printf("Loaded %d agent profiles", len(cfg.Profiles))
 
+	// Initialize SQLite chat store for cross-device conversation history
+	chatDB := filepath.Join(hh, "1claw-chat.db")
+	chatStore, err := store.NewChatStore(chatDB)
+	if err != nil {
+		log.Printf("Warning: could not open chat store: %v", err)
+		chatStore = nil
+	} else {
+		defer chatStore.Close()
+	}
+
 	// Create API server + WS handler
 	apiServer := api.NewServer(hub, bridge, cfg)
-	wsHandler := api.NewWSHandler(hub, bridge, cfg)
+	wsHandler := api.NewWSHandler(hub, bridge, cfg, chatStore)
 	apiServer.Router.HandleFunc(cfg.Server.WSPath, wsHandler.ServeWS)
 
 	// Build the HTTP server

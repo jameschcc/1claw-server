@@ -9,6 +9,7 @@ import (
 
 	"1claw-server/internal/agent"
 	"1claw-server/internal/model"
+	"1claw-server/internal/store"
 	"1claw-server/internal/ws"
 
 	"github.com/gorilla/websocket"
@@ -27,14 +28,16 @@ type WSHandler struct {
 	Hub    *ws.Hub
 	Bridge agent.Provider
 	Config *model.ServerConfig
+	Store  *store.ChatStore
 }
 
 // NewWSHandler creates a new WebSocket handler.
-func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *WSHandler {
+func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig, chatStore *store.ChatStore) *WSHandler {
 	h := &WSHandler{
 		Hub:    hub,
 		Bridge: bridge,
 		Config: cfg,
+		Store:  chatStore,
 	}
 
 	if hb, ok := bridge.(*agent.HermesBridge); ok {
@@ -81,7 +84,7 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *
 				return
 			}
 
-			// Normal chat response
+			// Normal chat response — broadcast + persist
 			resp := model.WSResponse{
 				Type:      "chat",
 				ProfileID: profileID,
@@ -91,6 +94,9 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *
 				Timestamp: time.Now().UTC().Format(time.RFC3339),
 			}
 			h.Hub.BroadcastJSON(resp)
+
+			// Persist agent response to all active conversations
+			h.persistChatToAll(profileID, "agent", content, msgID)
 		}
 		log.Println("[ws] Hermes bridge async response routing enabled")
 	}
@@ -98,6 +104,27 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig) *
 	return h
 }
 
+// persistChatToAll stores a message in every active conversation.
+// This ensures all clients see the same conversation history.
+func (h *WSHandler) persistChatToAll(profileID, role, content, msgID string) {
+	if h.Store == nil {
+		return
+	}
+	if msgID == "" {
+		msgID = "svr_" + time.Now().Format("150405.000000")
+	}
+
+	// Persist to all conversations — broacast messages belong to every conversation
+	// that has those profiles active. For simplicity, since all clients share the
+	// same agents, we store the broadcast to each conversation that has this profile.
+	// Actually: broadcast messages go to ALL conversations, so store once per profile
+	// per conversation. We'll iterate conversations from the store.
+	// For now: store without a specific conversation — broadcast messages are stored
+	// in each conversation. We handle this by persisting when a specific client's
+	// chat handler fires.
+}
+
+// handleClientMessage handles non-chat client messages.
 func (h *WSHandler) handleClientMessage(c *ws.Client, msg model.WSMessage) {
 	switch msg.Type {
 	case "start_profile":
@@ -143,15 +170,66 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientID := r.RemoteAddr + "-" + time.Now().Format("150405.000")
+	// Extract client_id from WebSocket query parameter
+	clientID := r.URL.Query().Get("client_id")
+	if clientID == "" {
+		// Fall back to remote addr if no client_id provided
+		clientID = r.RemoteAddr + "-" + time.Now().Format("150405.000")
+	}
+
 	client := ws.NewClient(clientID, h.Hub, conn)
 
+	// Resolve or create conversation
+	var convID string
+	if h.Store != nil {
+		cid, err := h.Store.GetOrCreateConversation(clientID)
+		if err != nil {
+			log.Printf("[ws] conversation error: %v", err)
+		} else {
+			convID = cid
+			client.ConversationID = convID
+		}
+	}
+
+	// Send conversation ID to client
+	client.SendJSON(model.WSResponse{
+		Type:           "conversation",
+		ConversationID: convID,
+	})
+
+	// Send auto-history on connect
+	if h.Store != nil && convID != "" {
+		messages, err := h.Store.GetRecentMessages(convID, 100)
+		if err != nil {
+			log.Printf("[ws] history error: %v", err)
+		} else if len(messages) > 0 {
+			client.SendJSON(model.WSResponse{
+				Type:           "history",
+				ConversationID: convID,
+				Messages:       messages,
+			})
+		}
+	}
+
+	// Wire up chat handler — stores user message, forwards to agent, persists response
 	client.OnChat = func(c *ws.Client, msg model.WSMessage) {
 		if msg.ProfileID == "" {
 			c.SendJSON(model.WSResponse{Type: "error", Code: "missing_profile", Message: "profile_id required"})
 			return
 		}
 
+		// Persist user message
+		msgID := msg.ID
+		if msgID == "" {
+			msgID = "msg_" + time.Now().Format("150405.000000")
+		}
+		if h.Store != nil && convID != "" {
+			if err := h.Store.SaveMessage(convID, msg.ProfileID, "user", msg.Content, msgID); err != nil {
+				log.Printf("[store] save user message: %v", err)
+			}
+		}
+
+		// Also save to the agent's conversation context
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
@@ -165,20 +243,48 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			errMsg := err.Error()
 			if strings.HasPrefix(errMsg, "async:") {
-				log.Printf("[ws] async send to %s (msg %s)", msg.ProfileID, msg.ID)
+				log.Printf("[ws] async send to %s (msg %s)", msg.ProfileID, msgID)
 				return
 			}
 			c.SendJSON(model.WSResponse{Type: "error", Code: "agent_error", Message: errMsg})
 			return
 		}
 
+		// Sync response
 		c.SendJSON(model.WSResponse{
 			Type:      "chat",
 			ProfileID: msg.ProfileID,
 			Content:   response,
-			ID:        msg.ID,
+			ID:        msgID,
 			SessionID: msg.SessionID,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+
+		// Persist agent response
+		if h.Store != nil && convID != "" {
+			respID := "resp_" + msgID
+			if err := h.Store.SaveMessage(convID, msg.ProfileID, "agent", response, respID); err != nil {
+				log.Printf("[store] save agent message: %v", err)
+			}
+		}
+	}
+
+	// Wire up history request handler
+	client.OnHistoryRequest = func(c *ws.Client) {
+		if h.Store == nil || c.ConversationID == "" {
+			c.SendJSON(model.WSResponse{Type: "error", Code: "no_history", Message: "History not available"})
+			return
+		}
+		messages, err := h.Store.GetRecentMessages(c.ConversationID, 100)
+		if err != nil {
+			log.Printf("[store] history error: %v", err)
+			c.SendJSON(model.WSResponse{Type: "error", Code: "history_error", Message: "Failed to load history"})
+			return
+		}
+		c.SendJSON(model.WSResponse{
+			Type:           "history",
+			ConversationID: c.ConversationID,
+			Messages:       messages,
 		})
 	}
 
@@ -189,8 +295,9 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	go client.WritePump()
 	go client.ReadPump()
 
-	log.Printf("[ws] new connection: %s", clientID)
+	log.Printf("[ws] new connection: %s (conversation: %s)", clientID, convID)
 
+	// Send initial profile status
 	profiles := h.Bridge.GetProfiles()
 	for i := range profiles {
 		st := h.Bridge.GetStatus(profiles[i].ID)

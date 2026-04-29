@@ -43,28 +43,32 @@ type ChatRequest struct {
 
 // WSMessage represents a WebSocket protocol message.
 type WSMessage struct {
-	Type      string             `json:"type"`
-	ProfileID string             `json:"profile_id,omitempty"`
-	Content   string             `json:"content,omitempty"`
-	ID        string             `json:"id,omitempty"`
-	SessionID string             `json:"session_id,omitempty"`
-	History   []ConversationTurn `json:"history,omitempty"`
-	Timestamp string             `json:"timestamp,omitempty"`
+	Type           string             `json:"type"`
+	ProfileID      string             `json:"profile_id,omitempty"`
+	Content        string             `json:"content,omitempty"`
+	ID             string             `json:"id,omitempty"`
+	SessionID      string             `json:"session_id,omitempty"`
+	History        []ConversationTurn `json:"history,omitempty"`
+	Timestamp      string             `json:"timestamp,omitempty"`
+	Messages       []ChatMessage      `json:"messages,omitempty"`
+	ConversationID string             `json:"conversation_id,omitempty"`
 }
 
 // WSResponse is the server-to-client response envelope.
 type WSResponse struct {
-	Type      string      `json:"type"`
-	Profiles  []Profile   `json:"profiles,omitempty"`
-	ProfileID string      `json:"profile_id,omitempty"`
-	Content   string      `json:"content,omitempty"`
-	ID        string      `json:"id,omitempty"`
-	SessionID string      `json:"session_id,omitempty"`
-	Timestamp string      `json:"timestamp,omitempty"`
-	Message   string      `json:"message,omitempty"`
-	Code      string      `json:"code,omitempty"`
-	Data      interface{} `json:"data,omitempty"`
-	Title     string      `json:"title,omitempty"`
+	Type           string        `json:"type"`
+	Profiles       []Profile     `json:"profiles,omitempty"`
+	ProfileID      string        `json:"profile_id,omitempty"`
+	Content        string        `json:"content,omitempty"`
+	ID             string        `json:"id,omitempty"`
+	SessionID      string        `json:"session_id,omitempty"`
+	Timestamp      string        `json:"timestamp,omitempty"`
+	Message        string        `json:"message,omitempty"`
+	Code           string        `json:"code,omitempty"`
+	Data           interface{}   `json:"data,omitempty"`
+	Title          string        `json:"title,omitempty"`
+	Messages       []ChatMessage `json:"messages,omitempty"`
+	ConversationID string        `json:"conversation_id,omitempty"`
 }
 
 // ServerConfig holds the full server configuration.
