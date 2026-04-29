@@ -99,7 +99,7 @@ def main():
                 continue
             role = str(entry.get("role", "")).strip()
             content = entry.get("content", "")
-            if role not in ("user", "assistant", "agent") or not isinstance(content, str):
+            if not isinstance(content, str):
                 continue
             content = content.strip()
             if not content:
