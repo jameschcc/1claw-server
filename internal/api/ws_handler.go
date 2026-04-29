@@ -263,6 +263,17 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Broadcast user message to ALL connected clients so multi-device
+		// users see each other's messages in real-time.
+		h.Hub.BroadcastJSON(model.WSResponse{
+			Type:      "user_message",
+			ProfileID: msg.ProfileID,
+			Content:   msg.Content,
+			ID:        msgID,
+			SessionID: msg.SessionID,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+
 		// Forward to agent
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
