@@ -21,6 +21,10 @@ const timestampFormat = "2006-01-02T15:04:05.000Z07:00"
 // ChatStore provides SQLite-backed persistent storage for conversations and messages.
 // This enables cross-device chat: clients identify with a client_id, and the server
 // remembers the conversation across reconnects and different devices.
+//
+// Profile-scoped messages (profile_messages table) enable cross-device history:
+// messages are stored by profile_id globally, so any device can retrieve all
+// messages for a profile regardless of which conversation/device they came from.
 type ChatStore struct {
 	db  *sql.DB
 	mu  sync.RWMutex
@@ -71,6 +75,16 @@ func (s *ChatStore) migrate() error {
 		 ON messages(conversation_id, timestamp DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_conv_role
 		 ON messages(conversation_id, role, timestamp DESC)`,
+		// Profile-scoped messages — enables cross-device history retrieval
+		`CREATE TABLE IF NOT EXISTS profile_messages (
+			id TEXT PRIMARY KEY,
+			profile_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			timestamp TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profile_msgs
+		 ON profile_messages(profile_id, timestamp)`,
 	}
 	for _, q := range queries {
 		if _, err := s.db.Exec(q); err != nil {
@@ -200,6 +214,59 @@ func (s *ChatStore) GetRecentMessages(conversationID string, limit int) ([]model
 	}
 
 	// Take only the last N
+	if len(messages) > limit {
+		messages = messages[len(messages)-limit:]
+	}
+
+	return messages, nil
+}
+
+// SaveProfileMessage stores a message in the profile-scoped table (cross-device).
+// Unlike conversation-scoped messages, these are accessible from any device.
+func (s *ChatStore) SaveProfileMessage(profileID, role, content, msgID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC().Format(timestampFormat)
+	_, err := s.db.Exec(
+		"INSERT OR REPLACE INTO profile_messages (id, profile_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+		msgID, profileID, role, content, now,
+	)
+	return err
+}
+
+// GetProfileMessages returns all stored messages for a given profile (cross-device).
+// Messages are ordered oldest-first. Limit caps the total returned.
+func (s *ChatStore) GetProfileMessages(profileID string, limit int) ([]model.ChatMessage, error) {
+	if limit <= 0 || limit > maxMessagesPerRole*3 {
+		limit = maxMessagesPerRole * 3
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT id, profile_id, role, content, timestamp
+		FROM profile_messages
+		WHERE profile_id = ?
+		ORDER BY timestamp ASC
+	`, profileID)
+	if err != nil {
+		return nil, fmt.Errorf("query profile messages: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []model.ChatMessage
+	for rows.Next() {
+		var m model.ChatMessage
+		var ts string
+		if err := rows.Scan(&m.ID, &m.ProfileID, &m.Role, &m.Content, &ts); err != nil {
+			return nil, fmt.Errorf("scan profile message: %w", err)
+		}
+		m.Timestamp, _ = time.Parse(timestampFormat, ts)
+		messages = append(messages, m)
+	}
+
 	if len(messages) > limit {
 		messages = messages[len(messages)-limit:]
 	}

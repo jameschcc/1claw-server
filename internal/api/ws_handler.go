@@ -130,24 +130,19 @@ func NewWSHandler(hub *ws.Hub, bridge agent.Provider, cfg *model.ServerConfig, c
 	return h
 }
 
-// persistChatToAll stores a message in every active conversation.
-// This ensures all clients see the same conversation history.
+// persistChatToAll stores a broadcast message in the global profile_messages table.
+// This ensures cross-device history: any device can retrieve all messages for
+// a profile regardless of which conversation/device they came from.
 func (h *WSHandler) persistChatToAll(profileID, role, content, msgID string) {
 	if h.Store == nil {
 		return
 	}
 	if msgID == "" {
-		msgID = "svr_" + time.Now().Format("150405.000000")
+		msgID = "glob_" + time.Now().Format("150405.000000")
 	}
-
-	// Persist to all conversations — broacast messages belong to every conversation
-	// that has those profiles active. For simplicity, since all clients share the
-	// same agents, we store the broadcast to each conversation that has this profile.
-	// Actually: broadcast messages go to ALL conversations, so store once per profile
-	// per conversation. We'll iterate conversations from the store.
-	// For now: store without a specific conversation — broadcast messages are stored
-	// in each conversation. We handle this by persisting when a specific client's
-	// chat handler fires.
+	if err := h.Store.SaveProfileMessage(profileID, role, content, msgID); err != nil {
+		log.Printf("[store] save profile message error: %v", err)
+	}
 }
 
 // handleClientMessage handles non-chat client messages.
@@ -191,6 +186,28 @@ func (h *WSHandler) handleClientMessage(c *ws.Client, msg model.WSMessage) {
 			Profiles: profiles,
 		})
 
+	case "get_profile_history":
+		pid := msg.ProfileID
+		if pid == "" {
+			c.SendJSON(model.WSResponse{Type: "error", Code: "missing_profile", Message: "profile_id required"})
+			return
+		}
+		if h.Store == nil {
+			c.SendJSON(model.WSResponse{Type: "error", Code: "no_store", Message: "History not available"})
+			return
+		}
+		messages, err := h.Store.GetProfileMessages(pid, 200)
+		if err != nil {
+			log.Printf("[store] profile history error: %v", err)
+			c.SendJSON(model.WSResponse{Type: "error", Code: "history_error", Message: "Failed to load history"})
+			return
+		}
+		c.SendJSON(model.WSResponse{
+			Type:      "profile_history",
+			ProfileID: pid,
+			Messages:  messages,
+		})
+
 	default:
 		c.SendJSON(model.WSResponse{Type: "error", Code: "unknown_type", Message: "Unknown: " + msg.Type})
 	}
@@ -231,7 +248,7 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		ConversationID: convID,
 	})
 
-	// Send auto-history on connect
+	// Send auto-history on connect (conversation-scoped)
 	if h.Store != nil && convID != "" {
 		messages, err := h.Store.GetRecentMessages(convID, 100)
 		if err != nil {
@@ -245,6 +262,26 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Send profile-scoped history for all profiles (cross-device)
+	if h.Store != nil {
+		profiles := h.Bridge.GetProfiles()
+		for _, p := range profiles {
+			msgs, err := h.Store.GetProfileMessages(p.ID, 200)
+			if err != nil {
+				log.Printf("[ws] profile history error for %s: %v", p.ID, err)
+				continue
+			}
+			if len(msgs) == 0 {
+				continue
+			}
+			client.SendJSON(model.WSResponse{
+				Type:      "profile_history",
+				ProfileID: p.ID,
+				Messages:  msgs,
+			})
+		}
+	}
+
 	// Wire up chat handler — stores user message, forwards to agent, persists response
 	client.OnChat = func(c *ws.Client, msg model.WSMessage) {
 		if msg.ProfileID == "" {
@@ -252,7 +289,7 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Persist user message
+		// Persist user message to conversation + profile messages (cross-device)
 		msgID := msg.ID
 		if msgID == "" {
 			msgID = "msg_" + time.Now().Format("150405.000000")
@@ -260,6 +297,13 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		if h.Store != nil && convID != "" {
 			if err := h.Store.SaveMessage(convID, msg.ProfileID, "user", msg.Content, msgID); err != nil {
 				log.Printf("[store] save user message: %v", err)
+			}
+		}
+		// Also save to profile-scoped messages for cross-device history
+		// (independent of convID — works for all devices)
+		if h.Store != nil {
+			if err := h.Store.SaveProfileMessage(msg.ProfileID, "user", msg.Content, msgID); err != nil {
+				log.Printf("[store] save user profile message: %v", err)
 			}
 		}
 
@@ -310,6 +354,13 @@ func (h *WSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			respID := "resp_" + msgID
 			if err := h.Store.SaveMessage(convID, msg.ProfileID, "agent", response, respID); err != nil {
 				log.Printf("[store] save agent message: %v", err)
+			}
+		}
+		// Also save to profile-scoped messages (cross-device)
+		if h.Store != nil {
+			respID := "resp_" + msgID
+			if err := h.Store.SaveProfileMessage(msg.ProfileID, "agent", response, respID); err != nil {
+				log.Printf("[store] save agent profile message: %v", err)
 			}
 		}
 	}
