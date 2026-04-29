@@ -159,13 +159,12 @@ def main():
             except Exception:
                 pass
 
+            persisted_history = load_persisted_history(session_id)
             conversation_history = None
-            if created:
-                persisted_history = load_persisted_history(session_id)
-                if persisted_history:
-                    conversation_history = persisted_history
-                elif history:
-                    conversation_history = history
+            if persisted_history:
+                conversation_history = persisted_history
+            elif history:
+                conversation_history = history
 
             # Streaming: accumulate text deltas and send per-chunk "chat" messages
             streamed_chunks = []
