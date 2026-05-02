@@ -80,10 +80,11 @@ type ServerConfig struct {
 
 // ServerSettings holds HTTP server settings.
 type ServerSettings struct {
-	Host    string `yaml:"host"`
-	Port    int    `yaml:"port"`
-	WSPath  string `yaml:"ws_path"`
-	APIPath string `yaml:"api_path"`
+	Host           string `yaml:"host"`
+	Port           int    `yaml:"port"`
+	WSPath         string `yaml:"ws_path"`
+	APIPath        string `yaml:"api_path"`
+	ExportPassword string `yaml:"export_password"`
 }
 
 // WSSettings holds WebSocket connection settings.

@@ -123,7 +123,7 @@ func main() {
 	}
 
 	// Create API server + WS handler
-	apiServer := api.NewServer(hub, bridge, cfg)
+	apiServer := api.NewServer(hub, bridge, cfg, hh)
 	wsHandler := api.NewWSHandler(hub, bridge, cfg, chatStore)
 	apiServer.Router.HandleFunc(cfg.Server.WSPath, wsHandler.ServeWS)
 
@@ -133,7 +133,7 @@ func main() {
 		Addr:         addr,
 		Handler:      apiServer.Router,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 

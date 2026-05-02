@@ -3,6 +3,7 @@ server:
   port: 8080
   ws_path: "/ws"
   api_path: "/api"
+  export_password: "hermes123"
 
 websocket:
   ping_interval: 30
