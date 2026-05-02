@@ -13,8 +13,20 @@ type Profile struct {
 	Online        bool      `json:"online" yaml:"-"`
 	Status        string    `json:"status" yaml:"-"`
 	TasksQueue    int       `json:"tasks_queue" yaml:"-"`
+	IsSpawn       bool      `json:"is_spawn,omitempty" yaml:"-"`
 	CreatedAt     time.Time `json:"created_at" yaml:"-"`
 	UpdatedAt     time.Time `json:"updated_at" yaml:"-"`
+}
+
+// CreateProfileRequest is the request body for creating a new profile.
+type CreateProfileRequest struct {
+	Name        string `json:"name"`
+	InheritFrom string `json:"inherit_from"`
+}
+
+// SpawnProfileRequest is the request body for spawning a duplicate process.
+type SpawnProfileRequest struct {
+	ProfileID string `json:"profile_id"`
 }
 
 // ChatMessage represents a single message in a conversation.

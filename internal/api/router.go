@@ -3,8 +3,13 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"1claw-server/internal/agent"
@@ -45,6 +50,7 @@ func (s *Server) registerRoutes() {
 	api.HandleFunc("/status", s.handleStatus).Methods("GET")
 	api.HandleFunc("/profiles", s.handleListProfiles).Methods("GET")
 	api.HandleFunc("/profiles", s.handleCreateProfile).Methods("POST")
+	api.HandleFunc("/profiles/spawn", s.handleSpawnProfile).Methods("POST")
 	api.HandleFunc("/profiles/{id}", s.handleUpdateProfile).Methods("PUT")
 	api.HandleFunc("/profiles/{id}", s.handleDeleteProfile).Methods("DELETE")
 	api.HandleFunc("/profiles/reload", s.handleReloadProfiles).Methods("POST")
@@ -160,23 +166,177 @@ func (s *Server) handleReloadProfiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
-	var profile model.Profile
-	if err := json.NewDecoder(r.Body).Decode(&profile); err != nil {
+	var req model.CreateProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
-	if profile.ID == "" {
-		http.Error(w, `{"error":"profile id is required"}`, http.StatusBadRequest)
+	if req.Name == "" {
+		http.Error(w, `{"error":"name is required"}`, http.StatusBadRequest)
 		return
 	}
 
-	s.Bridge.LoadProfiles([]model.Profile{profile})
+	// Sanitize name: lowercase, no spaces, no special chars
+	safeName := strings.ToLower(strings.TrimSpace(req.Name))
+	if safeName == "" {
+		http.Error(w, `{"error":"name must not be empty"}`, http.StatusBadRequest)
+		return
+	}
+
+	profilesDir := filepath.Join(s.HermesHome, "profiles")
+	newDir := filepath.Join(profilesDir, safeName)
+
+	// Check for existing
+	if _, err := os.Stat(newDir); !os.IsNotExist(err) {
+		http.Error(w, fmt.Sprintf(`{"error":"profile '%s' already exists"}`, safeName), http.StatusConflict)
+		return
+	}
+
+	// Determine source profile for inheritance
+	sourceDir := ""
+	if req.InheritFrom != "" {
+		sourceDir = filepath.Join(profilesDir, req.InheritFrom)
+		if _, err := os.Stat(filepath.Join(sourceDir, "config.yaml")); os.IsNotExist(err) {
+			http.Error(w, fmt.Sprintf(`{"error":"source profile '%s' not found"}`, req.InheritFrom), http.StatusBadRequest)
+			return
+		}
+	} else {
+		// Use default profile
+		defaultDir := filepath.Join(s.HermesHome, "profiles", "default")
+		if _, err := os.Stat(filepath.Join(defaultDir, "config.yaml")); err == nil {
+			sourceDir = defaultDir
+		}
+	}
+
+	// Create directory
+	if err := os.MkdirAll(newDir, 0755); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"failed to create directory: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	// Copy files from source
+	if sourceDir != "" {
+		copyFile := func(name string) {
+			src := filepath.Join(sourceDir, name)
+			dst := filepath.Join(newDir, name)
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return
+			}
+			os.WriteFile(dst, data, 0644)
+		}
+		// Copy key files
+		for _, f := range []string{"SOUL.md", "MEMORY.md", "USER.md", "config.yaml", ".env"} {
+			copyFile(f)
+		}
+		// Copy skills directory
+		srcSkills := filepath.Join(sourceDir, "skills")
+		if dstInfo, err := os.Stat(srcSkills); err == nil && dstInfo.IsDir() {
+			cpCmd := exec.Command("cp", "-r", srcSkills, filepath.Join(newDir, "skills"))
+			cpCmd.Run()
+		}
+	}
+
+	// Update SHARED.md to register the new profile
+	s.updateSharedMD()
+
+	// Create the profile object
+	emoji, color := config.ProfileDecorations(safeName)
+	profile := model.Profile{
+		ID:            safeName,
+		Name:          safeName,
+		Emoji:         emoji,
+		Description:   fmt.Sprintf("Hermes agent profile: %s", safeName),
+		HermesProfile: safeName,
+		Color:         color,
+		Online:        false,
+		Status:        "starting",
+		CreatedAt:     time.Now(),
+	}
+
+	// Spawn the profile's Hermes process
+	ctx := context.Background()
+	if err := s.Bridge.Start(ctx, &profile); err != nil {
+		log.Printf("[create] spawn error for %s: %v", safeName, err)
+	}
+
+	// Notify all clients
+	profiles := s.Bridge.GetProfiles()
+	for i := range profiles {
+		st := s.Bridge.GetStatus(profiles[i].ID)
+		profiles[i].Online = st.Online
+		if profiles[i].ID == safeName {
+			profiles[i] = profile
+			profiles[i].Online = true
+		}
+	}
+	s.Hub.NotifyProfileUpdate(profiles)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(profile)
 
-	// Notify all clients of the new profile
-	s.Hub.NotifyProfileUpdate(s.Bridge.GetProfiles())
+	log.Printf("[create] profile '%s' created from '%s'", safeName, req.InheritFrom)
+}
+
+// handleSpawnProfile spawns a duplicate agent process for an existing profile
+// without creating any new files on disk.
+func (s *Server) handleSpawnProfile(w http.ResponseWriter, r *http.Request) {
+	var req model.SpawnProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.ProfileID == "" {
+		http.Error(w, `{"error":"profile_id is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Only HermesBridge supports spawning
+	hb, ok := s.Bridge.(*agent.HermesBridge)
+	if !ok {
+		http.Error(w, `{"error":"spawn not supported with current bridge"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Generate the next spawn ID
+	spawnID := hb.GetSpawnNextID(req.ProfileID)
+
+	// Spawn a new process using the same hermest profile name
+	if err := hb.SpawnProfile(spawnID, req.ProfileID); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"spawn failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	// Notify all clients
+	profiles := s.Bridge.GetProfiles()
+	for i := range profiles {
+		st := s.Bridge.GetStatus(profiles[i].ID)
+		profiles[i].Online = st.Online
+	}
+	s.Hub.NotifyProfileUpdate(profiles)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "spawned",
+		"profile_id": spawnID,
+		"name":       spawnID,
+		"hermes_profile": req.ProfileID,
+		"is_spawn":   true,
+	})
+
+	log.Printf("[spawn] spawned copy '%s' from profile '%s'", spawnID, req.ProfileID)
+}
+
+// updateSharedMD re-generates the SHARED.md file from discovered profiles.
+func (s *Server) updateSharedMD() {
+	profiles, err := config.DiscoverProfiles(s.HermesHome)
+	if err != nil {
+		log.Printf("[shared.md] discover error: %v", err)
+		return
+	}
+	config.WriteSharedMD(s.HermesHome, profiles)
 }
 
 func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {

@@ -30,6 +30,7 @@ type agentProcess struct {
 type HermesBridge struct {
 	mu         sync.RWMutex
 	agents     map[string]*agentProcess // profile_id → subprocess
+	spawnInfo  map[string]string        // profile_id → hermesProfile name (for spawns)
 	python     string                   // path to python3
 	script     string                   // path to hermes_agent.py
 	HermesHome string
@@ -46,7 +47,8 @@ type HermesBridge struct {
 // NewHermesBridge creates a new per-profile bridge.
 func NewHermesBridge() *HermesBridge {
 	return &HermesBridge{
-		agents: make(map[string]*agentProcess),
+		agents:    make(map[string]*agentProcess),
+		spawnInfo: make(map[string]string),
 	}
 }
 
@@ -61,12 +63,25 @@ func (b *HermesBridge) Init() {
 }
 
 // SpawnProfile starts a subprocess for a single profile.
-func (b *HermesBridge) SpawnProfile(pid string) error {
+// pid is the unique tracking ID (e.g. "dev" or "dev-2").
+// hermesProfile is the actual Hermes profile name for the -p flag.
+// If hermesProfile is empty, it defaults to pid (normal case).
+func (b *HermesBridge) SpawnProfile(pid string, hermesProfile ...string) error {
+	profileName := pid
+	if len(hermesProfile) > 0 && hermesProfile[0] != "" {
+		profileName = hermesProfile[0]
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if _, exists := b.agents[pid]; exists {
 		return nil // already running
+	}
+
+	isSpawn := pid != profileName
+	if isSpawn {
+		b.spawnInfo[pid] = profileName
 	}
 
 	ap := &agentProcess{profileID: pid}
@@ -75,7 +90,7 @@ func (b *HermesBridge) SpawnProfile(pid string) error {
 
 	// Set profile-specific environment
 	ap.cmd.Env = os.Environ()
-	ap.cmd.Env = append(ap.cmd.Env, "HERMES_PROFILE="+pid)
+	ap.cmd.Env = append(ap.cmd.Env, "HERMES_PROFILE="+profileName)
 	ap.cmd.Env = append(ap.cmd.Env, "HERMES_HOME="+b.HermesHome)
 
 	// Stdin pipe
@@ -167,6 +182,7 @@ func (b *HermesBridge) Stop(profileID string) error {
 		return nil
 	}
 	delete(b.agents, profileID)
+	delete(b.spawnInfo, profileID)
 	if ap.cmd != nil && ap.cmd.Process != nil {
 		return ap.cmd.Process.Kill()
 	}
@@ -267,11 +283,16 @@ func (b *HermesBridge) GetProfiles() []model.Profile {
 	defer b.mu.RUnlock()
 	profiles := make([]model.Profile, 0, len(b.agents))
 	for pid := range b.agents {
-		profiles = append(profiles, model.Profile{
+		p := model.Profile{
 			ID:     pid,
 			Name:   pid,
 			Online: true,
-		})
+		}
+		if hp, ok := b.spawnInfo[pid]; ok {
+			p.HermesProfile = hp
+			p.IsSpawn = true
+		}
+		profiles = append(profiles, p)
 	}
 	return profiles
 }
@@ -285,8 +306,33 @@ func (b *HermesBridge) Close() error {
 			ap.cmd.Process.Kill()
 		}
 		delete(b.agents, pid)
+		delete(b.spawnInfo, pid)
 	}
 	return nil
+}
+
+// GetSpawnNextID returns the next available spawn ID for a profile.
+// For profile "dev", returns "dev-2", "dev-3" etc.
+func (b *HermesBridge) GetSpawnNextID(profileID string) string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	maxN := 1
+	for pid := range b.agents {
+		if pid == profileID {
+			if maxN < 1 {
+				maxN = 1
+			}
+			continue
+		}
+		prefix := profileID + "-"
+		if len(pid) > len(prefix) && pid[:len(prefix)] == prefix {
+			var n int
+			if _, err := fmt.Sscanf(pid[len(prefix):], "%d", &n); err == nil && n >= maxN {
+				maxN = n
+			}
+		}
+	}
+	return fmt.Sprintf("%s-%d", profileID, maxN+1)
 }
 
 // SendRaw sends an arbitrary JSON command to a specific profile's process.

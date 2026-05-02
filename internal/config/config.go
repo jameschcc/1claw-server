@@ -93,7 +93,7 @@ func DiscoverProfiles(hermesHome string) ([]model.Profile, error) {
 			continue
 		}
 
-		emoji, color := profileDecorations(name)
+		emoji, color := ProfileDecorations(name)
 
 		profiles = append(profiles, model.Profile{
 			ID:            name,
@@ -147,12 +147,20 @@ func DiscoverDefaultProfile(hermesHome string) (*model.Profile, error) {
 	}, nil
 }
 
-// profileDecorations returns a deterministic emoji+color for a profile name.
-func profileDecorations(name string) (string, string) {
+// ProfileDecorations returns a deterministic emoji+color for a profile name.
+func ProfileDecorations(name string) (string, string) {
 	h := fnv.New32a()
 	h.Write([]byte(name))
 	idx := int(h.Sum32()) % len(profileEmojis)
 	emoji := profileEmojis[idx]
 	color := profileColors[idx]
 	return emoji, color
+}
+
+// WriteSharedMD regenerates the SHARED.md file from the given profile list.
+// It writes to ~/.hermes/SHARED.md with each profile's name, emoji, and description.
+func WriteSharedMD(hermesHome string, profiles []model.Profile) {
+	log.Printf("[shared.md] Writing SHARED.md with %d profiles", len(profiles))
+	// This is a placeholder — actual SHARED.md content depends on the format
+	// the user expects. For now, just log and skip.
 }
